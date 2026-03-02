@@ -98,7 +98,13 @@ export async function handleOb11Event(params: {
     // Check if message has any content (text or attachments)
     const hasTextContent = rawBody.length > 0;
     const hasMediaContent = (event.message && Array.isArray(event.message))
-      ? event.message.some(seg => seg.type === "image" || seg.type === "video" || seg.type === "record")
+      ? event.message.some(
+          (seg) =>
+            seg.type === "image" ||
+            seg.type === "video" ||
+            seg.type === "record" ||
+            seg.type === "file",
+        )
       : false;
 
     if (!hasTextContent && !hasMediaContent) {
@@ -295,6 +301,14 @@ export async function handleOb11Event(params: {
           if (url) {
             mediaUrls.push(url);
             mediaInfo += `[Voice: ${url}]\n`;
+          }
+        }
+        if (seg.type === "file") {
+          const url = seg.data?.url || seg.data?.file;
+          if (url) {
+            mediaUrls.push(url);
+            const fileName = seg.data?.name || seg.data?.file || "file";
+            mediaInfo += `[File: ${fileName}]\n`;
           }
         }
       }
