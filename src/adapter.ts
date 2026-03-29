@@ -61,7 +61,8 @@ export async function startQqClient(params: {
     await httpClient.start();
     client = httpClient;
   } else {
-    throw new Error(`QQ connection type not supported yet: ${connection.type}`);
+    const type = (connection as { type?: string }).type ?? "unknown";
+    throw new Error(`QQ connection type not supported yet: ${type}`);
   }
 
   activeClients.set(accountId, client);
@@ -137,7 +138,27 @@ class Ob11WsClient implements Ob11Client {
       this.stop();
     });
 
-    await Promise.all([this.connectActionSocket(), this.connectEventSocket()]);
+    // Connect both sockets, with proper cleanup on partial failure
+    let connectionError: Error | null = null;
+    try {
+      await Promise.all([
+        this.connectActionSocket().catch((err) => {
+          connectionError = err instanceof Error ? err : new Error(String(err));
+          throw err;
+        }),
+        this.connectEventSocket().catch((err) => {
+          connectionError = err instanceof Error ? err : new Error(String(err));
+          throw err;
+        }),
+      ]);
+    } catch {
+      // On partial failure, both sockets may be partially initialized
+      // stop() will clean up any connected sockets
+      const err = connectionError ?? new Error("QQ socket connection failed");
+      this.params.log.warn(`QQ socket connection failed: ${err.message}`);
+      this.stop();
+      throw err;
+    }
   }
 
   async sendAction(action: string, params?: Record<string, unknown>): Promise<OB11ActionResponse> {
@@ -207,7 +228,9 @@ class Ob11WsClient implements Ob11Client {
         if (this.closed || this.params.abortSignal.aborted) return;
         this.params.log.warn("QQ action socket closed; reconnecting...");
         setTimeout(() => {
-          void this.connectActionSocket().catch(() => undefined);
+          this.connectActionSocket().catch((err) => {
+            this.params.log.error(`QQ action socket reconnect failed: ${String(err)}`);
+          });
         }, RECONNECT_DELAY_MS);
       });
 
@@ -305,6 +328,15 @@ class Ob11HttpClient implements Ob11Client {
   private closed = false;
   private eventLoopPromise: Promise<void> | null = null;
 
+  // 401 circuit breaker
+  private authErrorCount = 0;
+  private readonly AUTH_ERROR_THRESHOLD = 3;
+  private circuitOpen = false;
+
+  // Retry configuration
+  private readonly RETRY_DELAYS_MS = [1000, 3000, 10000];
+  private readonly MAX_RETRIES = 3;
+
   constructor(
     private params: {
       connection: QQHttpConnectionConfig;
@@ -326,6 +358,19 @@ class Ob11HttpClient implements Ob11Client {
   }
 
   async sendAction(action: string, params?: Record<string, unknown>): Promise<OB11ActionResponse> {
+    // Check circuit breaker
+    if (this.circuitOpen) {
+      throw new Error("QQ HTTP client circuit breaker open (401 auth failure)");
+    }
+
+    return this.sendActionWithRetry(action, params, 0);
+  }
+
+  private async sendActionWithRetry(
+    action: string,
+    params: Record<string, unknown> | undefined,
+    attemptNumber: number,
+  ): Promise<OB11ActionResponse> {
     const { connection } = this.params;
     const url = buildHttpUrl({
       host: connection.host,
@@ -338,18 +383,64 @@ class Ob11HttpClient implements Ob11Client {
       "Content-Type": "application/json",
       ...(createAuthHeaders(connection.token) ?? {}),
     };
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(params ?? {}),
-      signal: this.params.abortSignal,
-    });
 
-    if (!response.ok) {
-      throw new Error(`OB11 HTTP action failed (${response.status}): ${action}`);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(params ?? {}),
+        signal: this.params.abortSignal,
+      });
+
+      // Handle 401 - increment error count and possibly open circuit
+      if (response.status === 401) {
+        this.authErrorCount++;
+        this.params.log.warn(`[QQ/HTTP] 401 auth error (${this.authErrorCount}/${this.AUTH_ERROR_THRESHOLD}) for ${action}`);
+
+        if (this.authErrorCount >= this.AUTH_ERROR_THRESHOLD) {
+          this.circuitOpen = true;
+          this.params.log.error(`[QQ/HTTP] Circuit breaker opened due to repeated 401 errors`);
+          // Auto-reset after 5 minutes
+          setTimeout(() => {
+            this.circuitOpen = false;
+            this.authErrorCount = 0;
+            this.params.log.info(`[QQ/HTTP] Circuit breaker reset`);
+          }, 5 * 60 * 1000);
+        }
+
+        throw new Error(`OB11 HTTP auth failed (401): ${action}`);
+      }
+
+      // Handle other non-ok responses
+      if (!response.ok) {
+        // Reset auth error count on non-401 errors
+        this.authErrorCount = 0;
+        throw new Error(`OB11 HTTP action failed (${response.status}): ${action}`);
+      }
+
+      // Success - reset auth error count
+      this.authErrorCount = 0;
+      return (await response.json()) as OB11ActionResponse;
+    } catch (err) {
+      // Check if retryable
+      if (attemptNumber >= this.MAX_RETRIES) {
+        throw err;
+      }
+
+      // Retry on network errors and 5xx responses
+      const isNetworkError =
+        err instanceof TypeError ||
+        (err instanceof Error && /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|fetch failed/i.test(err.message));
+
+      if (isNetworkError) {
+        const delay = this.RETRY_DELAYS_MS[Math.min(attemptNumber, this.RETRY_DELAYS_MS.length - 1)];
+        this.params.log.info(`[QQ/HTTP] Retrying ${action} in ${delay}ms (attempt ${attemptNumber + 1}/${this.MAX_RETRIES})`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return this.sendActionWithRetry(action, params, attemptNumber + 1);
+      }
+
+      throw err;
     }
-
-    return (await response.json()) as OB11ActionResponse;
   }
 
   stop(): void {
