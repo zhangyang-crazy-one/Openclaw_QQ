@@ -1,5 +1,5 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk";
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "./sdk-compat.js";
 import type { QQAccountConfig, QQConfig, QQConnectionConfig, ResolvedQQAccount } from "./types.js";
 
 export interface ResolvedGroupConfig {
@@ -54,13 +54,16 @@ function mergeQqAccountConfig(cfg: OpenClawConfig, accountId: string): QQAccount
   return { ...base, ...account };
 }
 
-const SUPPORTED_CONNECTION_TYPES = new Set<QQConnectionConfig["type"]>(["ws", "http"]);
+const SUPPORTED_CONNECTION_TYPES = new Set<QQConnectionConfig["type"]>(["ws", "http", "native"]);
 
 export function isConnectionConfigured(connection?: QQConnectionConfig): boolean {
   if (!connection) return false;
   if (!SUPPORTED_CONNECTION_TYPES.has(connection.type)) return false;
   if (connection.type === "ws" || connection.type === "http") {
     return Boolean(connection.host && connection.port);
+  }
+  if (connection.type === "native") {
+    return Boolean(connection.uin);
   }
   return true;
 }
@@ -73,6 +76,9 @@ export function resolveConnectionIssue(connection?: QQConnectionConfig): string 
   if (connection.type === "ws" || connection.type === "http") {
     if (!connection.host?.trim()) return "connection host is missing";
     if (!connection.port) return "connection port is missing";
+  }
+  if (connection.type === "native") {
+    if (!connection.uin) return "QQ uin (account number) is required for native login";
   }
   return null;
 }

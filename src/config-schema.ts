@@ -1,4 +1,4 @@
-import { DmPolicySchema, GroupPolicySchema, MarkdownConfigSchema } from "openclaw/plugin-sdk";
+import { DmPolicySchema, GroupPolicySchema, MarkdownConfigSchema } from "./sdk-compat.js";
 import { z } from "zod";
 
 const allowFromEntry = z.union([z.string(), z.number()]);

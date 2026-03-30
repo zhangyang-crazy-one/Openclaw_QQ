@@ -1,14 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
 import {
   logInboundDrop,
-  mergeAllowlist,
   resolveControlCommandGate,
+} from "openclaw/plugin-sdk/irc";
+import {
+  mergeAllowlist,
   resolveMentionGatingWithBypass,
-  type OpenClawConfig,
-  type RuntimeEnv,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/zalouser";
 import type {
   OB11ActionResponse,
   OB11Event,
@@ -16,6 +17,7 @@ import type {
   ResolvedQQAccount,
 } from "./types.js";
 import { getActiveQqClient } from "./adapter.js";
+import { getActiveNativeClient } from "./qq-native.js";
 import { resolveGroupConfig } from "./config.js";
 import { parseCqSegments } from "./cqcode.js";
 import { parseOb11Message, hasSelfMention } from "./message-utils.js";
@@ -26,6 +28,18 @@ import { formatQqTarget, normalizeAllowEntry, type QQTarget } from "./targets.js
 
 const CHANNEL_ID = "qq" as const;
 const QQ_INBOUND_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Safely convert a value to a QQ ID (positive integer).
+ * Throws if the value is not a valid positive number.
+ */
+function safeQqId(value: string | number, fieldName: string): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
+    throw new Error(`Invalid QQ ID for ${fieldName}: ${JSON.stringify(value)}`);
+  }
+  return num;
+}
 
 type StatusSink = (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
 
@@ -54,9 +68,9 @@ function buildTarget(params: {
   isGroup: boolean;
   senderId: string;
   groupId?: string;
-}): QQTarget | null {
+}): QQTarget {
   if (params.isGroup) {
-    if (!params.groupId) return null;
+    if (!params.groupId) throw new Error("buildTarget: groupId required for group target");
     return { kind: "group", id: params.groupId };
   }
   return { kind: "private", id: params.senderId };
@@ -90,13 +104,9 @@ function resolveLocalMediaPath(value: string): string | null {
 
 function isOb11ActionSuccess(response: OB11ActionResponse | undefined): boolean {
   if (!response) return false;
-  if (typeof response.status === "string" && response.status.toLowerCase() !== "ok") {
-    return false;
-  }
-  if (typeof response.retcode === "number" && response.retcode !== 0) {
-    return false;
-  }
-  return true;
+  if (response.status && response.status.toLowerCase() === "ok") return true;
+  if (typeof response.retcode === "number") return response.retcode === 0;
+  return false;
 }
 
 function extractMediaSourceFromActionData(value: unknown, depth = 0): string | null {
@@ -335,6 +345,250 @@ function resolveInboundSegments(
   }));
 }
 
+/** Validation result for inbound events */
+type InboundValidation = {
+  ok: boolean;
+  postType: string;
+  subType: string;
+  messageType: string;
+  isGroup: boolean;
+  senderId: string;
+  groupId?: string;
+  target: QQTarget;
+  groupConfig: ReturnType<typeof resolveGroupConfig> | null;
+  parsed: ReturnType<typeof parseOb11Message>;
+  rawBody: string;
+  inboundSegments?: OB11MessageSegment[];
+  hasTextContent: boolean;
+  hasMediaContent: boolean;
+};
+
+/**
+ * Validate inbound event and extract basic information.
+ */
+function validateInboundEvent(params: {
+  event: OB11Event;
+  account: ResolvedQQAccount;
+}): InboundValidation | null {
+  const { event, account } = params;
+
+  const postType = String(event.post_type ?? "").toLowerCase();
+  if (postType !== "message" && postType !== "message_sent" && postType !== "meta_event") {
+    return null;
+  }
+  if (postType === "meta_event") {
+    return null;
+  }
+
+  const subType = String(event.sub_type ?? "").toLowerCase();
+  if (
+    postType === "message" &&
+    subType === "offline" &&
+    !account.connection?.reportOfflineMessage
+  ) {
+    return null;
+  }
+
+  const messageType = String(event.message_type ?? "").toLowerCase();
+  const isGroup = messageType === "group";
+  const senderId = event.user_id != null ? String(event.user_id) : "";
+  if (!senderId) {
+    return null;
+  }
+
+  const groupId = event.group_id != null ? String(event.group_id) : undefined;
+  const target = buildTarget({ isGroup, senderId, groupId });
+
+  const groupConfig = isGroup ? resolveGroupConfig(account.config, groupId ?? "") : null;
+
+  if (postType === "message_sent" && !account.connection?.reportSelfMessage) {
+    return null;
+  }
+
+  const parsed = parseOb11Message(event.message ?? event.raw_message);
+  const rawBody = parsed.text.trim();
+  const inboundSegments = resolveInboundSegments(event.message ?? event.raw_message);
+
+  // Check if message has any content (text or attachments)
+  const hasTextContent = rawBody.length > 0;
+  const hasMediaContent = Boolean(
+    inboundSegments?.some(
+      (seg) =>
+        seg.type === "image" ||
+        seg.type === "video" ||
+        seg.type === "record" ||
+        seg.type === "file",
+    ),
+  );
+
+  if (!hasTextContent && !hasMediaContent) {
+    return null;
+  }
+
+  return {
+    ok: true,
+    postType,
+    subType,
+    messageType,
+    isGroup,
+    senderId,
+    groupId,
+    target,
+    groupConfig,
+    parsed,
+    rawBody,
+    inboundSegments,
+    hasTextContent,
+    hasMediaContent,
+  };
+}
+
+/**
+ * Check if sender is allowed based on DM/group policy.
+ */
+async function checkInboundAccess(params: {
+  validation: InboundValidation;
+  event: OB11Event;
+  account: ResolvedQQAccount;
+  config: OpenClawConfig;
+  runtime: RuntimeEnv;
+}): Promise<{ allowed: boolean; reason?: string }> {
+  const { validation, event, account, config, runtime } = params;
+  const { isGroup, senderId, groupId, groupConfig, parsed } = validation;
+  const core = getQqRuntime();
+
+  const dmPolicy = account.config.dmPolicy ?? "pairing";
+  const defaultGroupPolicy = config.channels?.defaults?.groupPolicy;
+  const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
+
+  const configGroupAllowFrom = normalizeAllowList(account.config.groupAllowFrom);
+  const storeAllowFrom = (core.channel?.pairing)
+    ? await core.channel.pairing.readAllowFromStore({ channel: CHANNEL_ID, accountId: account.accountId }).catch(() => [])
+    : [];
+
+  const effectiveAllowFrom = normalizeAllowList(
+    mergeAllowlist({ existing: account.config.allowFrom, additions: storeAllowFrom }),
+  );
+
+  const allowTextCommands = core.channel?.commands?.shouldHandleTextCommands({
+    cfg: config as OpenClawConfig,
+    surface: CHANNEL_ID,
+  }) ?? false;
+  const useAccessGroups = config.commands?.useAccessGroups !== false;
+  const senderAllowedForCommands = isAllowed(
+    isGroup ? configGroupAllowFrom : effectiveAllowFrom,
+    isGroup ? `group:${groupId ?? ""}` : senderId,
+  );
+  const hasControlCommand = core.channel?.text?.hasControlCommand(validation.rawBody, config as OpenClawConfig) ?? false;
+  const commandGate = resolveControlCommandGate({
+    useAccessGroups,
+    authorizers: [
+      {
+        configured: (isGroup ? configGroupAllowFrom : effectiveAllowFrom).configured,
+        allowed: senderAllowedForCommands,
+      },
+    ],
+    allowTextCommands,
+    hasControlCommand,
+  });
+
+  if (isGroup) {
+    if (!groupConfig?.enabled) {
+      return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (group disabled in config)` };
+    }
+    if (groupPolicy === "disabled") {
+      return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (groupPolicy=disabled)` };
+    }
+    if (groupPolicy === "allowlist") {
+      const groupKey = `group:${groupId ?? ""}`;
+      if (!isAllowed(configGroupAllowFrom, groupKey)) {
+        return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (not allowlisted)` };
+      }
+    }
+
+    if (commandGate.shouldBlock) {
+      return { allowed: false, reason: "control command (unauthorized)" };
+    }
+
+    const selfId = event.self_id != null ? String(event.self_id) : undefined;
+    const wasMentioned = hasSelfMention(parsed.mentions, selfId);
+    const requireMention = groupConfig?.requireMention ?? true;
+    const canDetectMention = isGroup;
+    const mentionGate = resolveMentionGatingWithBypass({
+      isGroup,
+      requireMention,
+      canDetectMention,
+      wasMentioned,
+      allowTextCommands,
+      hasControlCommand,
+      commandAuthorized: commandGate.commandAuthorized,
+    });
+    if (mentionGate.shouldSkip) {
+      return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (no mention)` };
+    }
+  } else {
+    if (dmPolicy === "disabled") {
+      return { allowed: false, reason: `qq: drop DM sender=${senderId} (dmPolicy=disabled)` };
+    }
+    const senderAllowed = isAllowed(effectiveAllowFrom, senderId);
+    if (dmPolicy !== "open" && !senderAllowed) {
+      if (dmPolicy === "pairing" && core.channel?.pairing) {
+        await handlePairingRequest({
+          core,
+          senderId,
+          account,
+          event,
+          target: validation.target,
+        });
+      }
+      return { allowed: false, reason: `qq: drop DM sender=${senderId} (dmPolicy=${dmPolicy})` };
+    }
+  }
+
+  return { allowed: true };
+}
+
+async function handlePairingRequest(params: {
+  core: ReturnType<typeof getQqRuntime>;
+  senderId: string;
+  account: ResolvedQQAccount;
+  event: OB11Event;
+  target: QQTarget;
+}): Promise<void> {
+  const { core, senderId, account, event, target } = params;
+  const { code, created } = await core.channel.pairing.upsertPairingRequest({
+    channel: CHANNEL_ID,
+    id: senderId,
+    accountId: account.accountId,
+    meta: { name: event.sender?.nickname ?? undefined },
+  });
+  if (created) {
+    try {
+      const client = getActiveQqClient(account.accountId);
+      if (client) {
+        const pairingText = core.channel?.pairing?.buildPairingReply({
+          channel: CHANNEL_ID,
+          idLine: `Your QQ user id: ${senderId}`,
+          code,
+        }) ?? "";
+        const response = await sendOb11Message({
+          client,
+          target,
+          text: pairingText,
+        });
+        rememberSelfSentResponse({
+          accountId: account.accountId,
+          response,
+          target: formatQqTarget(target),
+          text: pairingText,
+        });
+      }
+    } catch (err) {
+      // Error handling is done by caller
+    }
+  }
+}
+
 export async function handleOb11Event(params: {
   event: OB11Event;
   account: ResolvedQQAccount;
@@ -345,64 +599,21 @@ export async function handleOb11Event(params: {
   const { event, account, config, runtime, statusSink } = params;
 
   try {
-    const postType = String(event.post_type ?? "").toLowerCase();
-    if (postType !== "message" && postType !== "message_sent") {
-      return;
-    }
-    const subType = String(event.sub_type ?? "").toLowerCase();
-    if (
-      postType === "message" &&
-      subType === "offline" &&
-      !account.connection?.reportOfflineMessage
-    ) {
+    // Step 1: Validate event and extract basic info
+    const validation = validateInboundEvent({ event, account });
+    if (!validation) {
       return;
     }
 
-    const messageType = String(event.message_type ?? "").toLowerCase();
-    const isGroup = messageType === "group";
-    const senderId = event.user_id != null ? String(event.user_id) : "";
-    if (!senderId) {
-      return;
-    }
-
-    const groupId = event.group_id != null ? String(event.group_id) : undefined;
-    const target = buildTarget({ isGroup, senderId, groupId });
-    if (!target) {
-      return;
-    }
-    const groupConfig = isGroup ? resolveGroupConfig(account.config, groupId ?? "") : null;
-
-    if (postType === "message_sent" && !account.connection?.reportSelfMessage) {
-      return;
-    }
-    const parsed = parseOb11Message(event.message ?? event.raw_message);
-    const rawBody = parsed.text.trim();
-    const inboundSegments = resolveInboundSegments(event.message ?? event.raw_message);
-
-    // Check if message has any content (text or attachments)
-    const hasTextContent = rawBody.length > 0;
-    const hasMediaContent = Boolean(
-      inboundSegments?.some(
-        (seg) =>
-          seg.type === "image" ||
-          seg.type === "video" ||
-          seg.type === "record" ||
-          seg.type === "file",
-      ),
-    );
-
-    if (!hasTextContent && !hasMediaContent) {
-      return;
-    }
-
-    if (postType === "message_sent") {
+    // Step 2: Check if this is a self-sent message
+    if (validation.postType === "message_sent") {
       const messageId = event.message_id != null ? String(event.message_id) : undefined;
       if (
         wasSelfSentMessage({
           accountId: account.accountId,
           messageId,
-          target: formatQqTarget(target),
-          text: rawBody,
+          target: formatQqTarget(validation.target),
+          text: validation.rawBody,
         })
       ) {
         return;
@@ -410,147 +621,33 @@ export async function handleOb11Event(params: {
     }
 
     const core = getQqRuntime();
-
-    const selfId = event.self_id != null ? String(event.self_id) : undefined;
-    const wasMentioned = isGroup ? hasSelfMention(parsed.mentions, selfId) : false;
     const timestamp = typeof event.time === "number" ? event.time * 1000 : Date.now();
-
     statusSink?.({ lastInboundAt: timestamp });
 
-    const dmPolicy = account.config.dmPolicy ?? "pairing";
-    const defaultGroupPolicy = config.channels?.defaults?.groupPolicy;
-    const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
-
-    const configGroupAllowFrom = normalizeAllowList(account.config.groupAllowFrom);
-    const storeAllowFrom = (core.channel?.pairing)
-      ? await core.channel.pairing.readAllowFromStore(CHANNEL_ID).catch(() => [])
-      : [];
-
-    const effectiveAllowFrom = normalizeAllowList(
-      mergeAllowlist({ existing: account.config.allowFrom, additions: storeAllowFrom }),
-    );
-
-    const allowTextCommands = core.channel?.commands?.shouldHandleTextCommands({
-      cfg: config as OpenClawConfig,
-      surface: CHANNEL_ID,
-    }) ?? false;
-    const useAccessGroups = config.commands?.useAccessGroups !== false;
-    const senderAllowedForCommands = isAllowed(
-      isGroup ? configGroupAllowFrom : effectiveAllowFrom,
-      isGroup ? `group:${groupId ?? ""}` : senderId,
-    );
-    const hasControlCommand = core.channel?.text?.hasControlCommand(rawBody, config as OpenClawConfig) ?? false;
-    const commandGate = resolveControlCommandGate({
-      useAccessGroups,
-      authorizers: [
-        {
-          configured: (isGroup ? configGroupAllowFrom : effectiveAllowFrom).configured,
-          allowed: senderAllowedForCommands,
-        },
-      ],
-      allowTextCommands,
-      hasControlCommand,
-    });
-    const commandAuthorized = commandGate.commandAuthorized;
-
-    if (isGroup) {
-      if (!groupConfig?.enabled) {
-        runtime.log?.(`qq: drop group ${groupId ?? ""} (group disabled in config)`);
-        return;
-      }
-      if (groupPolicy === "disabled") {
-        runtime.log?.(`qq: drop group ${groupId ?? ""} (groupPolicy=disabled)`);
-        return;
-      }
-      if (groupPolicy === "allowlist") {
-        const groupKey = `group:${groupId ?? ""}`;
-        if (!isAllowed(configGroupAllowFrom, groupKey)) {
-          runtime.log?.(`qq: drop group ${groupId ?? ""} (not allowlisted)`);
-          return;
-        }
-      }
-
-      if (commandGate.shouldBlock) {
-        logInboundDrop({
-          log: (message) => runtime.log?.(message),
-          channel: CHANNEL_ID,
-          reason: "control command (unauthorized)",
-          target: senderId,
-        });
-        return;
-      }
-
-      const requireMention = groupConfig?.requireMention ?? true;
-      const mentionGate = resolveMentionGatingWithBypass({
-        isGroup,
-        requireMention,
-        wasMentioned,
-        allowTextCommands,
-        hasControlCommand,
-        commandAuthorized,
-      });
-      if (mentionGate.shouldSkip) {
-        runtime.log?.(`qq: drop group ${groupId ?? ""} (no mention)`);
-        return;
-      }
-    } else {
-      if (dmPolicy === "disabled") {
-        runtime.log?.(`qq: drop DM sender=${senderId} (dmPolicy=disabled)`);
-        return;
-      }
-      const senderAllowed = isAllowed(effectiveAllowFrom, senderId);
-      if (dmPolicy !== "open" && !senderAllowed) {
-        if (dmPolicy === "pairing" && core.channel?.pairing) {
-          const { code, created } = await core.channel.pairing.upsertPairingRequest({
-            channel: CHANNEL_ID,
-            id: senderId,
-            meta: { name: event.sender?.nickname ?? undefined },
-          });
-          if (created) {
-            try {
-              const client = getActiveQqClient(account.accountId);
-              if (client) {
-                const pairingText = core.channel?.pairing?.buildPairingReply({
-                  channel: CHANNEL_ID,
-                  idLine: `Your QQ user id: ${senderId}`,
-                  code,
-                }) ?? "";
-                const response = await sendOb11Message({
-                  client,
-                  target,
-                  text: pairingText,
-                });
-                rememberSelfSentResponse({
-                  accountId: account.accountId,
-                  response,
-                  target: formatQqTarget(target),
-                  text: pairingText,
-                });
-                statusSink?.({ lastOutboundAt: Date.now() });
-              }
-            } catch (err) {
-              runtime.error?.(`qq: pairing reply failed for ${senderId}: ${String(err)}`);
-            }
-          }
-        }
-        runtime.log?.(`qq: drop DM sender=${senderId} (dmPolicy=${dmPolicy})`);
-        return;
-      }
+    // Step 3: Check access control (DM policy, group policy, mention, etc.)
+    const accessResult = await checkInboundAccess({ validation, event, account, config, runtime });
+    if (!accessResult.allowed) {
+      runtime.log?.(accessResult.reason ?? "dropped by access control");
+      return;
     }
 
+    // Step 4: Resolve routing
     const route = core.channel?.routing?.resolveAgentRoute({
       cfg: config as OpenClawConfig,
       channel: CHANNEL_ID,
       accountId: account.accountId,
       peer: {
-        kind: isGroup ? "group" : "dm",
-        id: isGroup ? (groupId ?? senderId) : senderId,
+        kind: validation.isGroup ? "group" : "direct",
+        id: validation.isGroup ? (validation.groupId ?? validation.senderId) : validation.senderId,
       },
     }) ?? { agentId: "default", sessionKey: "" };
-    const effectiveAgentId = groupConfig?.agentId ?? route.agentId;
+    const effectiveAgentId = validation.groupConfig?.agentId ?? route.agentId;
 
+    // Step 5: Build session and context
     const senderName = event.sender?.card?.trim() || event.sender?.nickname?.trim() || undefined;
-    const fromLabel = isGroup ? `group:${groupId ?? ""}` : senderName || `user:${senderId}`;
+    const fromLabel = validation.isGroup
+      ? `group:${validation.groupId ?? ""}`
+      : senderName || `user:${validation.senderId}`;
 
     const storePath = core.channel?.session?.resolveStorePath(config.session?.store, {
       agentId: effectiveAgentId,
@@ -561,12 +658,13 @@ export async function handleOb11Event(params: {
       sessionKey: route.sessionKey,
     }) ?? Date.now();
 
+    // Step 6: Collect and process media
     const media = await collectInboundMedia({
       accountId: account.accountId,
-      segments: inboundSegments,
+      segments: validation.inboundSegments,
       runtime,
     });
-    const normalizedRawBody = replaceMediaReferences(rawBody, media.replacements);
+    const normalizedRawBody = replaceMediaReferences(validation.rawBody, media.replacements);
 
     // Combine text body with media info
     const fullBody = normalizedRawBody
@@ -582,28 +680,31 @@ export async function handleOb11Event(params: {
       body: normalizedRawBody,
     }) ?? normalizedRawBody;
 
+    const selfId = event.self_id != null ? String(event.self_id) : undefined;
+    const wasMentioned = validation.isGroup ? hasSelfMention(validation.parsed.mentions, selfId) : false;
+
     const ctxPayload = core.channel?.reply?.finalizeInboundContext({
       Body: body,
       BodyForAgent: fullBody,
       RawBody: fullBody,
       CommandBody: fullBody,
-      From: isGroup ? `qq:group:${groupId ?? ""}` : `qq:${senderId}`,
-      To: `qq:${formatQqTarget(target)}`,
+      From: validation.isGroup ? `qq:group:${validation.groupId ?? ""}` : `qq:${validation.senderId}`,
+      To: `qq:${formatQqTarget(validation.target)}`,
       SessionKey: route.sessionKey,
       AccountId: route.accountId,
-      ChatType: isGroup ? "group" : "direct",
+      ChatType: validation.isGroup ? "group" : "direct",
       ConversationLabel: fromLabel,
       SenderName: senderName,
-      SenderId: senderId,
-      GroupSubject: isGroup ? (groupId ?? undefined) : undefined,
+      SenderId: validation.senderId,
+      GroupSubject: validation.isGroup ? (validation.groupId ?? undefined) : undefined,
       Provider: CHANNEL_ID,
       Surface: CHANNEL_ID,
-      WasMentioned: isGroup ? wasMentioned : undefined,
+      WasMentioned: validation.isGroup ? wasMentioned : undefined,
       MessageSid: event.message_id != null ? String(event.message_id) : undefined,
       Timestamp: timestamp,
       OriginatingChannel: CHANNEL_ID,
-      OriginatingTo: `qq:${formatQqTarget(target)}`,
-      CommandAuthorized: commandAuthorized,
+      OriginatingTo: `qq:${formatQqTarget(validation.target)}`,
+      CommandAuthorized: true,
       MediaUrls: media.mediaUrls.length > 0 ? media.mediaUrls : undefined,
     });
 
@@ -627,13 +728,40 @@ export async function handleOb11Event(params: {
         deliver: async (payload) => {
           try {
             const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+
+            // Try native client first, then OB11
+            const nativeClient = getActiveNativeClient(account.accountId);
+            const replyTarget = validation.target;
+            if (nativeClient) {
+              // Native oicq client path
+              let messageId: string;
+              if (replyTarget.kind === "group") {
+                messageId = String(
+                  await nativeClient.sendGroupMsg(safeQqId(replyTarget.id, "groupId"), payload.text ?? ""),
+                );
+              } else {
+                messageId = String(
+                  await nativeClient.sendPrivateMsg(safeQqId(replyTarget.id, "userId"), payload.text ?? ""),
+                );
+              }
+              rememberSelfSentResponse({
+                accountId: account.accountId,
+                response: { status: "ok", data: { message_id: messageId } },
+                target: formatQqTarget(replyTarget),
+                text: payload.text ?? "",
+              });
+              statusSink?.({ lastOutboundAt: Date.now() });
+              return;
+            }
+
+            // OB11 client path
             const client = getActiveQqClient(account.accountId);
             if (!client) {
               throw new Error(`QQ client not running for account ${account.accountId}`);
             }
             const response = await sendOb11Message({
               client,
-              target,
+              target: replyTarget,
               text: payload.text ?? "",
               replyToId: payload.replyToId,
               mediaUrl,
@@ -641,7 +769,7 @@ export async function handleOb11Event(params: {
             rememberSelfSentResponse({
               accountId: account.accountId,
               response,
-              target: formatQqTarget(target),
+              target: formatQqTarget(replyTarget),
               text: payload.text ?? "",
             });
             statusSink?.({ lastOutboundAt: Date.now() });
@@ -658,5 +786,6 @@ export async function handleOb11Event(params: {
     });
   } catch (err) {
     runtime.error?.(`qq handleOb11Event error: ${String(err)}`);
+    throw err;
   }
 }

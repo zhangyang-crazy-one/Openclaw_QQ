@@ -7,6 +7,9 @@
     "openclaw": "workspace:*"
   },
   "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "oicq": "^2.3.1",
+    "qrcode-terminal": "^4.0.0",
     "ws": "^8.18.0",
     "zod": "^4.3.6"
   },

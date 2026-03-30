@@ -1,6 +1,25 @@
-import type { DmPolicy, GroupPolicy, MarkdownConfig } from "openclaw/plugin-sdk";
+import type { DmPolicy, GroupPolicy, MarkdownConfig } from "./sdk-compat.js";
 
 export type QQMessageFormat = "array" | "string";
+
+export type QQNativeConnectionConfig = {
+  /** Native QQ protocol via oicq (no external bot service required). */
+  type: "native";
+  /** QQ account number (uin). */
+  uin: number;
+  /** Login password. If omitted, QR code login is used. */
+  password?: string;
+  /** Use QR code login instead of password. Default: true if no password. */
+  qrLogin?: boolean;
+  /** Device platform. Default: 2 (Android). */
+  platform?: number;
+  /** Data directory for storing login tokens/session. Defaults to ~/.oicq. */
+  dataDir?: string;
+  /** Whether to report self-sent messages. Default: false. */
+  reportSelfMessage?: boolean;
+  /** Whether to report offline messages. Default: false. */
+  reportOfflineMessage?: boolean;
+};
 
 export type QQWsConnectionConfig = {
   type: "ws";
@@ -27,7 +46,8 @@ export type QQHttpConnectionConfig = {
 
 export type QQConnectionConfig =
   | QQWsConnectionConfig
-  | QQHttpConnectionConfig;
+  | QQHttpConnectionConfig
+  | QQNativeConnectionConfig;
 
 export type QQGroupConfig = {
   requireMention?: boolean;

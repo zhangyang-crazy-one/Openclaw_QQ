@@ -35,11 +35,14 @@ export type Ob11Client = {
 const activeClients = new Map<string, Ob11Client>();
 
 export function getActiveQqClient(accountId: string): Ob11Client | undefined {
-  return activeClients.get(accountId);
+  const key = String(accountId);
+  const client = activeClients.get(key);
+  console.log(`[DEBUG] getActiveQqClient(${accountId}) [key="${key}"]: ${client ? "found" : "NOT found"}, active clients: ${JSON.stringify([...activeClients.keys()])}`);
+  return client;
 }
 
 export function clearActiveQqClient(accountId: string): void {
-  activeClients.delete(accountId);
+  activeClients.delete(String(accountId));
 }
 
 export async function startQqClient(params: {
@@ -65,7 +68,8 @@ export async function startQqClient(params: {
     throw new Error(`QQ connection type not supported yet: ${type}`);
   }
 
-  activeClients.set(accountId, client);
+  activeClients.set(String(accountId), client);
+  log.info?.(`[DEBUG] activeClients.set(${accountId}): now has ${activeClients.size} clients: ${JSON.stringify([...activeClients.keys()])}`);
   return client;
 }
 
@@ -223,10 +227,10 @@ class Ob11WsClient implements Ob11Client {
         this.handleActionMessage(raw.toString());
       });
 
-      socket.on("close", () => {
+      socket.on("close", (code, reason) => {
         this.actionSocket = null;
         if (this.closed || this.params.abortSignal.aborted) return;
-        this.params.log.warn("QQ action socket closed; reconnecting...");
+        this.params.log.warn(`QQ action socket closed: code=${code}, reason=${reason?.toString() ?? "none"}; reconnecting...`);
         setTimeout(() => {
           this.connectActionSocket().catch((err) => {
             this.params.log.error(`QQ action socket reconnect failed: ${String(err)}`);
@@ -268,10 +272,10 @@ class Ob11WsClient implements Ob11Client {
         this.handleEventMessage(raw.toString());
       });
 
-      socket.on("close", () => {
+      socket.on("close", (code, reason) => {
         this.eventSocket = null;
         if (this.closed || this.params.abortSignal.aborted) return;
-        this.params.log.warn("QQ event socket closed; reconnecting...");
+        this.params.log.warn(`QQ event socket closed: code=${code}, reason=${reason?.toString() ?? "none"}; reconnecting...`);
         setTimeout(() => {
           void this.connectEventSocket().catch(() => undefined);
         }, RECONNECT_DELAY_MS);

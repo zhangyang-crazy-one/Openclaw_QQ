@@ -1,25 +1,27 @@
-import type {
-  ChannelDirectoryEntry,
-  ChannelPlugin,
-  ChannelSetupInput,
-  ChannelLogSink,
-  RuntimeEnv,
-} from "openclaw/plugin-sdk";
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { ChannelPlugin, RuntimeLogger } from "openclaw/plugin-sdk";
+import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
+import type { ChannelSetupInput } from "openclaw/plugin-sdk";
+import { qqSetupWizard } from "./channel.setup.js";
+import type { ChannelDirectoryEntry, ChannelLogSink } from "./sdk-compat.js";
 import {
-  applyAccountNameToChannelSection,
-  buildChannelConfigSchema,
   DEFAULT_ACCOUNT_ID,
-  deleteAccountFromConfigSection,
-  formatPairingApproveHint,
-  migrateBaseNameToDefaultAccount,
   normalizeAccountId,
   PAIRING_APPROVED_MESSAGE,
+  formatPairingApproveHint,
+  migrateBaseNameToDefaultAccount,
+  deleteAccountFromConfigSection,
   setAccountEnabledInConfigSection,
-} from "openclaw/plugin-sdk";
+  applyAccountNameToChannelSection,
+  buildChannelConfigSchema,
+} from "./sdk-compat.js";
 import type { Ob11Client } from "./adapter.js";
-import type { OB11ActionResponse, QQConnectionConfig, ResolvedQQAccount } from "./types.js";
+import type { OB11ActionResponse, QQConnectionConfig, QQNativeConnectionConfig, ResolvedQQAccount } from "./types.js";
 import { clearActiveQqClient, getActiveQqClient, startQqClient } from "./adapter.js";
+import {
+  clearActiveNativeClient,
+  getActiveNativeClient,
+  startQqNativeClient,
+} from "./qq-native.js";
 import { QQConfigSchema } from "./config-schema.js";
 import {
   isConnectionConfigured,
@@ -74,12 +76,19 @@ function resolveConnectionBaseUrl(connection?: QQConnectionConfig): string | und
   return undefined;
 }
 
-function resolveLogger(runtime: RuntimeEnv, log?: ChannelLogSink): ChannelLogSink {
-  if (log) return log;
+function resolveLogger(runtime: RuntimeEnv, log?: ChannelLogSink): RuntimeLogger {
+  if (log) {
+    return {
+      info: log.info ? (message: string) => log.info!(message) : (message: string) => runtime.log(message),
+      warn: log.warn ? (message: string) => log.warn!(message) : (message: string) => runtime.log(message),
+      error: log.error ? (message: string) => log.error!(message) : (message: string) => runtime.error(message),
+      debug: log.debug ? (message: string) => log.debug!(message) : undefined,
+    };
+  }
   return {
-    info: (message) => runtime.log(message),
-    warn: (message) => runtime.log(message),
-    error: (message) => runtime.error(message),
+    info: (message: string) => runtime.log(message),
+    warn: (message: string) => runtime.log(message),
+    error: (message: string) => runtime.error(message),
   };
 }
 
@@ -221,6 +230,92 @@ function requireActiveClient(params: { cfg: OpenClawConfig; accountId?: string |
   return { accountId, client };
 }
 
+/** Get the logged-in user's info from either native or OB11 client. */
+async function getSelfInfoFromClient(accountId: string): Promise<{ userId: number; nickname?: string } | null> {
+  // Try native client first
+  const { getActiveNativeClient } = await import("./qq-native.js");
+  const nativeClient = getActiveNativeClient(accountId);
+  if (nativeClient) {
+    try {
+      const info = await nativeClient.client.getLoginInfo();
+      if (info) {
+        return { userId: nativeClient.getUin(), nickname: info.nickname };
+      }
+    } catch {
+      // Fall through to OB11
+    }
+  }
+
+  // OB11 client
+  const client = getActiveQqClient(accountId);
+  if (!client) return null;
+  const response = await client.sendAction("get_login_info");
+  if (!isActionOk(response)) return null;
+  const data = response.data as Record<string, unknown> | undefined;
+  const userId = data?.user_id ?? data?.userId;
+  if (userId == null) return null;
+  const nickname = typeof data?.nickname === "string" ? data.nickname.trim() : undefined;
+  return { userId: Number(userId), nickname };
+}
+
+/** Get friend list from either native or OB11 client. */
+async function getFriendListFromClient(accountId: string): Promise<Array<{ userId: number; nickname?: string; remark?: string }>> {
+  // Try native client first
+  const { getActiveNativeClient } = await import("./qq-native.js");
+  const nativeClient = getActiveNativeClient(accountId);
+  if (nativeClient) {
+    try {
+      const list = await nativeClient.client.getFriendList();
+      return list.map((f: { uin: number; nickname?: string; remark?: string }) => ({
+        userId: f.uin,
+        nickname: f.nickname,
+        remark: f.remark,
+      }));
+    } catch {
+      // Fall through to OB11
+    }
+  }
+
+  // OB11 client
+  const client = getActiveQqClient(accountId);
+  if (!client) return [];
+  const response = await client.sendAction("get_friend_list");
+  if (!isActionOk(response)) return [];
+  return (Array.isArray(response.data) ? response.data : []).map((item) => ({
+    userId: item.user_id ?? item.userId!,
+    nickname: item.nickname,
+    remark: item.remark,
+  }));
+}
+
+/** Get group list from either native or OB11 client. */
+async function getGroupListFromClient(accountId: string): Promise<Array<{ groupId: number; groupName?: string }>> {
+  // Try native client first
+  const { getActiveNativeClient } = await import("./qq-native.js");
+  const nativeClient = getActiveNativeClient(accountId);
+  if (nativeClient) {
+    try {
+      const list = await nativeClient.client.getGroupList();
+      return list.map((g: { group_id: number; group_name?: string }) => ({
+        groupId: g.group_id,
+        groupName: g.group_name,
+      }));
+    } catch {
+      // Fall through to OB11
+    }
+  }
+
+  // OB11 client
+  const client = getActiveQqClient(accountId);
+  if (!client) return [];
+  const response = await client.sendAction("get_group_list");
+  if (!isActionOk(response)) return [];
+  return (Array.isArray(response.data) ? response.data : []).map((item) => ({
+    groupId: item.group_id ?? item.groupId!,
+    groupName: item.group_name ?? item.groupName,
+  }));
+}
+
 function isActionOk(response: OB11ActionResponse): boolean {
   if (response.status) return response.status === "ok";
   if (typeof response.retcode === "number") return response.retcode === 0;
@@ -265,7 +360,7 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
     polls: false,
     reactions: true,
     threads: false,
-    nativeCommands: false,
+    nativeCommands: true,
     groupManagement: true,
     blockStreaming: true,
   },
@@ -323,7 +418,8 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
     resolveDmPolicy: ({ cfg, accountId, account }) => {
       const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
       const qqConfig = cfg.channels?.qq as Record<string, unknown> | undefined;
-      const useAccountPath = Boolean(qqConfig?.accounts?.[resolvedAccountId]);
+      const qqAccounts = qqConfig?.accounts as Record<string, unknown> | undefined;
+      const useAccountPath = Boolean(qqAccounts?.[resolvedAccountId]);
       const basePath = useAccountPath
         ? `channels.qq.accounts.${resolvedAccountId}.`
         : "channels.qq.";
@@ -420,41 +516,29 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
   },
   directory: {
     self: async ({ cfg, accountId }) => {
-      const { client } = requireActiveClient({ cfg, accountId });
-      const response = await client.sendAction("get_login_info");
-      if (!isActionOk(response)) return null;
-      const data = response.data as Record<string, unknown> | undefined;
-      const userId = data?.user_id ?? data?.userId;
-      if (userId == null) return null;
-      const nickname = typeof data?.nickname === "string" ? data.nickname.trim() : undefined;
+      const resolvedAccountId = resolveOutboundAccountId(cfg, accountId);
+      const info = await getSelfInfoFromClient(resolvedAccountId);
+      if (!info) return null;
       return {
         kind: "user",
-        id: String(userId),
-        name: nickname,
-        raw: data,
-      } satisfies ChannelDirectoryEntry;
+        id: String(info.userId),
+        name: info.nickname,
+      };
     },
     listPeers: async ({ cfg, accountId, query, limit }) => {
-      const { client } = requireActiveClient({ cfg, accountId });
-      const response = await client.sendAction("get_friend_list");
-      if (!isActionOk(response)) {
-        throw new Error(resolveActionError(response));
-      }
-      const data = Array.isArray(response.data) ? response.data : [];
+      const resolvedAccountId = resolveOutboundAccountId(cfg, accountId);
+      const friends = await getFriendListFromClient(resolvedAccountId);
       const q = query?.trim().toLowerCase() ?? "";
-      const entries = data
-        .map((entry) => entry as Record<string, unknown>)
+      const entries = friends
         .map((entry) => ({
-          id: entry.user_id ?? entry.userId,
-          nickname: entry.remark ?? entry.nickname ?? entry.nick ?? "",
-          raw: entry,
+          id: entry.userId,
+          nickname: entry.remark ?? entry.nickname ?? "",
         }))
         .filter((entry) => entry.id != null)
         .map((entry) => ({
           kind: "user" as const,
           id: String(entry.id),
           name: entry.nickname ? String(entry.nickname).trim() : undefined,
-          raw: entry.raw,
         }))
         .filter((entry) => {
           if (!q) return true;
@@ -466,26 +550,19 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
       return entries;
     },
     listGroups: async ({ cfg, accountId, query, limit }) => {
-      const { client } = requireActiveClient({ cfg, accountId });
-      const response = await client.sendAction("get_group_list");
-      if (!isActionOk(response)) {
-        throw new Error(resolveActionError(response));
-      }
-      const data = Array.isArray(response.data) ? response.data : [];
+      const resolvedAccountId = resolveOutboundAccountId(cfg, accountId);
+      const groups = await getGroupListFromClient(resolvedAccountId);
       const q = query?.trim().toLowerCase() ?? "";
-      const entries = data
-        .map((entry) => entry as Record<string, unknown>)
+      const entries = groups
         .map((entry) => ({
-          id: entry.group_id ?? entry.groupId,
-          name: entry.group_name ?? entry.groupName ?? "",
-          raw: entry,
+          id: entry.groupId,
+          name: entry.groupName ?? "",
         }))
         .filter((entry) => entry.id != null)
         .map((entry) => ({
           kind: "group" as const,
           id: String(entry.id),
           name: entry.name ? String(entry.name).trim() : undefined,
-          raw: entry.raw,
         }))
         .filter((entry) => {
           if (!q) return true;
@@ -537,6 +614,7 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
       });
     },
   },
+  setupWizard: qqSetupWizard,
     gateway: {
     startAccount: async (ctx) => {
       const account = ctx.account;
@@ -545,37 +623,117 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
         throw new Error("QQ connection not configured");
       }
 
-      // NOTE: Runtime is already set during register() via setQqRuntime(api.runtime)
-      // ctx.runtime is RuntimeEnv (log, error, exit only), not the full PluginRuntime
-
       const logger = resolveLogger(ctx.runtime, ctx.log);
 
-      await startQqClient({
-        accountId: account.accountId,
-        connection,
-        log: logger,
-        abortSignal: ctx.abortSignal,
-        onEvent: (event) =>
-          handleOb11Event({
-            event,
-            account,
-            config: ctx.cfg,
-            runtime: ctx.runtime,
-            statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
-          }),
-      });
+      if (connection.type === "native") {
+        // Native oicq client (no external bot service needed)
+        const nativeConfig = connection as QQNativeConnectionConfig;
+        logger.info(`[${account.accountId}] Starting QQ native client for uin ${nativeConfig.uin}`);
 
-      ctx.log?.info(
-        `[${account.accountId}] QQ client connected (${resolveConnectionBaseUrl(connection) ?? connection.type})`,
-      );
+        const isQrLogin = nativeConfig.qrLogin ?? !nativeConfig.password;
+
+        await startQqNativeClient({
+          accountId: account.accountId,
+          config: {
+            uin: nativeConfig.uin,
+            password: nativeConfig.password,
+            qrLogin: isQrLogin,
+            platform: nativeConfig.platform,
+            dataDir: nativeConfig.dataDir,
+          },
+          abortSignal: ctx.abortSignal,
+          callbacks: {
+            log: logger,
+            onEvent: (event) =>
+              handleOb11Event({
+                event,
+                account,
+                config: ctx.cfg,
+                runtime: ctx.runtime,
+                statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+              }),
+            onLoginSuccess: (userId) => {
+              logger.info(`[${account.accountId}] QQ native login success: ${userId}`);
+            },
+            onQrCode: async (data) => {
+              logger.info(`[${account.accountId}] QR code received (url: ${data.url ?? "none"})`);
+
+              // If QR login, trigger TUI to display QR code and wait for completion
+              if (isQrLogin) {
+                try {
+                  const { runNativeLoginTui } = await import("./qq-tui-impl.js");
+                  await runNativeLoginTui(
+                    account.accountId,
+                    ctx.runtime,
+                    (userId) => {
+                      logger.info(`[${account.accountId}] User ${userId} logged in via QR`);
+                      ctx.setStatus({ accountId: account.accountId, lastStartAt: Date.now() });
+                    },
+                    (reason) => {
+                      logger.error(`[${account.accountId}] QR login failed: ${reason ?? "unknown"}`);
+                    },
+                  );
+                } catch (err) {
+                  logger.error(`[${account.accountId}] Failed to start TUI: ${String(err)}`);
+                }
+              }
+            },
+            onLoginError: (message) => {
+              logger.error(`[${account.accountId}] QQ native login error: ${message}`);
+            },
+            onDisconnect: (reason) => {
+              logger.warn(`[${account.accountId}] QQ native disconnected: ${reason}`);
+            },
+          },
+        });
+
+        logger.info(`[${account.accountId}] QQ native client started`);
+
+        // Keep startAccount from resolving so gateway doesn't think channel exited.
+        // The client runs in background and reconnect is handled by adapter.ts close handlers.
+        await new Promise(() => {});
+      } else {
+        // OB11 client (ws/http) - external bot service required
+        await startQqClient({
+          accountId: account.accountId,
+          connection,
+          log: logger,
+          abortSignal: ctx.abortSignal,
+          onEvent: (event) =>
+            handleOb11Event({
+              event,
+              account,
+              config: ctx.cfg,
+              runtime: ctx.runtime,
+              statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+            }),
+        });
+
+        ctx.log?.info(
+          `[${account.accountId}] QQ client connected (${resolveConnectionBaseUrl(connection) ?? connection.type})`,
+        );
+
+        // Keep startAccount from resolving so gateway doesn't think channel exited.
+        // The client runs in background and reconnect is handled by adapter.ts close handlers.
+        await new Promise(() => {});
+      }
     },
     stopAccount: async ({ cfg, accountId }) => {
       const resolvedAccountId = resolveOutboundAccountId(cfg, accountId);
-      const client = getActiveQqClient(resolvedAccountId);
-      if (client) {
-        client.stop();
+
+      // Try native client first, then fall back to OB11 client
+      const nativeClient = getActiveNativeClient(resolvedAccountId);
+      if (nativeClient) {
+        nativeClient.stop();
+        clearActiveNativeClient(resolvedAccountId);
+        return;
       }
-      clearActiveQqClient(resolvedAccountId);
+
+      const ob11Client = getActiveQqClient(resolvedAccountId);
+      if (ob11Client) {
+        ob11Client.stop();
+        clearActiveQqClient(resolvedAccountId);
+      }
     },
   },
 };

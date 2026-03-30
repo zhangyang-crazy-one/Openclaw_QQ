@@ -42,23 +42,31 @@ describe("qqMessageActions", () => {
 
   it("returns empty actions when no configured enabled accounts", () => {
     mockListEnabledQqAccounts.mockReturnValue([]);
-    expect(qqMessageActions.listActions?.({ cfg: {} as OpenClawConfig })).toEqual([]);
+    expect(qqMessageActions.describeMessageTool?.({ cfg: {} as OpenClawConfig })).toEqual({
+      actions: [],
+      capabilities: [],
+      schema: null,
+    });
   });
 
   it("lists supported QQ actions when at least one account is configured", () => {
     mockListEnabledQqAccounts.mockReturnValue([
       { accountId: "default", enabled: true, configured: true } as never,
     ]);
-    expect(qqMessageActions.listActions?.({ cfg: {} as OpenClawConfig })).toEqual([
-      "send",
-      "react",
-      "delete",
-      "timeout",
-      "kick",
-      "ban",
-      "renameGroup",
-      "permissions",
-    ]);
+    expect(qqMessageActions.describeMessageTool?.({ cfg: {} as OpenClawConfig })).toEqual({
+      actions: [
+        "send",
+        "react",
+        "delete",
+        "timeout",
+        "kick",
+        "ban",
+        "renameGroup",
+        "permissions",
+      ],
+      capabilities: [],
+      schema: null,
+    });
   });
 
   it("dispatches react action to addReaction by default", async () => {

@@ -1,12 +1,10 @@
-import type {
-  ChannelOutboundAdapter,
-  ChannelOutboundContext,
-  ChannelOutboundTargetMode,
-  OutboundDeliveryResult,
-} from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import type { ChannelOutboundContext } from "openclaw/plugin-sdk/twitch";
+import type { ChannelOutboundTargetMode } from "./sdk-compat.js";
+import { DEFAULT_ACCOUNT_ID, type OutboundDeliveryResult } from "./sdk-compat.js";
 import type { OB11ActionResponse } from "./types.js";
 import { getActiveQqClient } from "./adapter.js";
+import { getActiveNativeClient } from "./qq-native.js";
 import { resolveDefaultQqAccountId, resolveQqAccount } from "./config.js";
 import { getQqRuntime } from "./runtime.js";
 import { extractMessageIdFromResponse, rememberSelfSentResponse } from "./self-sent.js";
@@ -14,6 +12,18 @@ import { sendOb11Message } from "./send.js";
 import { formatQqTarget, normalizeAllowEntry, parseQqTarget, type QQTarget } from "./targets.js";
 function resolveMessageId(response: OB11ActionResponse): string {
   return extractMessageIdFromResponse(response) ?? String(Date.now());
+}
+
+/**
+ * Safely convert a value to a QQ ID (positive integer).
+ * Throws if the value is not a valid positive number.
+ */
+function safeQqId(value: string | number, fieldName: string): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
+    throw new Error(`Invalid QQ ID for ${fieldName}: ${JSON.stringify(value)}`);
+  }
+  return num;
 }
 
 function normalizeAllowList(allowFrom: Array<string | number> | undefined): {
@@ -89,6 +99,39 @@ async function sendMessage(params: {
     throw targetResult.error;
   }
 
+  // Try native oicq client first, then fall back to OB11 client
+  const nativeClient = getActiveNativeClient(account.accountId);
+  if (nativeClient) {
+    // Native oicq client path
+    const target = targetResult.target;
+    let messageId: string;
+
+    if (target.kind === "group") {
+      messageId = String(
+        await nativeClient.sendGroupMsg(safeQqId(target.id, "groupId"), text ?? ""),
+      );
+    } else {
+      messageId = String(
+        await nativeClient.sendPrivateMsg(safeQqId(target.id, "userId"), text ?? ""),
+      );
+    }
+
+    rememberSelfSentResponse({
+      accountId: account.accountId,
+      response: { status: "ok", data: { message_id: messageId } },
+      target: formatQqTarget(target),
+      text: text ?? "",
+    });
+
+    return {
+      channel: "qq",
+      messageId,
+      timestamp: Date.now(),
+      chatId: formatQqTarget(target),
+    };
+  }
+
+  // OB11 client path (external bot service)
   const client = getActiveQqClient(account.accountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${account.accountId}`);
@@ -112,7 +155,7 @@ async function sendMessage(params: {
     channel: "qq",
     messageId: resolveMessageId(response),
     timestamp: Date.now(),
-    to: formatQqTarget(targetResult.target),
+    chatId: formatQqTarget(targetResult.target),
   };
 }
 
@@ -122,7 +165,7 @@ export const qqOutbound: ChannelOutboundAdapter = {
     return getQqRuntime().channel.text.chunkMarkdownText(text, limit);
   },
   chunkerMode: "markdown",
-  textChunkLimit: 2000,
+  textChunkLimit: 4096,
   resolveTarget: ({ to, allowFrom, mode }) => {
     const result = resolveOutboundTarget({ to, allowFrom, mode });
     if (!result.ok) return { ok: false, error: result.error };
@@ -130,15 +173,37 @@ export const qqOutbound: ChannelOutboundAdapter = {
   },
   sendText: async (ctx) => sendMessage({ ctx }),
   sendMedia: async (ctx) => sendMessage({ ctx, mediaUrl: ctx.mediaUrl }),
-  deleteMessage: async (ctx) => {
-    await deleteQqMessage({
-      cfg: ctx.cfg,
-      accountId: ctx.accountId ?? undefined,
-      messageId: ctx.messageId,
-    });
-    return { success: true };
-  },
 };
+
+export async function editMessage(params: {
+  cfg: { channels?: { qq?: unknown } };
+  accountId?: string;
+  messageId: string | number;
+  newText: string;
+}): Promise<void> {
+  const resolvedAccountId =
+    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    // oicq doesn't have a direct edit API, but we can recall the message
+    // For now, throw not supported
+    throw new Error("Edit message is not supported via native oicq client");
+  }
+
+  const client = getActiveQqClient(resolvedAccountId);
+  if (!client) {
+    throw new Error(`QQ client not running for account ${resolvedAccountId}`);
+  }
+  const response = await client.sendAction("edit_msg", {
+    message_id: params.messageId,
+    new_text: params.newText,
+  });
+  if (response.status !== "ok" && response.retcode !== 0) {
+    throw new Error(response.msg ?? `Failed to edit message: retcode=${response.retcode}`);
+  }
+}
 
 export async function deleteQqMessage(params: {
   cfg: { channels?: { qq?: unknown } };
@@ -147,6 +212,14 @@ export async function deleteQqMessage(params: {
 }): Promise<void> {
   const resolvedAccountId =
     params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.deleteMsg(safeQqId(params.messageId, "messageId"));
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
@@ -167,13 +240,25 @@ export async function muteUser(params: {
   duration: number; // seconds, 0 = unmute
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setGroupBan(
+      safeQqId(params.groupId, "groupId"),
+      safeQqId(params.userId, "userId"),
+      params.duration,
+    );
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_group_ban", {
-    group_id: Number(params.groupId),
-    user_id: Number(params.userId),
+    group_id: safeQqId(params.groupId, "groupId"),
+    user_id: safeQqId(params.userId, "userId"),
     duration: params.duration,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -189,13 +274,25 @@ export async function kickUser(params: {
   rejectAdd?: boolean;
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setGroupKick(
+      safeQqId(params.groupId, "groupId"),
+      safeQqId(params.userId, "userId"),
+      params.rejectAdd ?? false,
+    );
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_group_kick", {
-    group_id: Number(params.groupId),
-    user_id: Number(params.userId),
+    group_id: safeQqId(params.groupId, "groupId"),
+    user_id: safeQqId(params.userId, "userId"),
     reject_add_request: params.rejectAdd ?? false,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -211,12 +308,20 @@ export async function setGroupName(params: {
 }): Promise<void> {
   const resolvedAccountId =
     params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setGroupName(safeQqId(params.groupId, "groupId"), params.name);
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_group_name", {
-    group_id: Number(params.groupId),
+    group_id: safeQqId(params.groupId, "groupId"),
     group_name: params.name,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -232,13 +337,25 @@ export async function setGroupCard(params: {
   card: string;
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setGroupCard(
+      safeQqId(params.groupId, "groupId"),
+      safeQqId(params.userId, "userId"),
+      params.card,
+    );
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_group_card", {
-    group_id: Number(params.groupId),
-    user_id: Number(params.userId),
+    group_id: safeQqId(params.groupId, "groupId"),
+    user_id: safeQqId(params.userId, "userId"),
     card: params.card,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -253,12 +370,20 @@ export async function setGroupWholeBan(params: {
   enable: boolean;
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setGroupWholeBan(safeQqId(params.groupId, "groupId"), params.enable);
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_group_whole_ban", {
-    group_id: Number(params.groupId),
+    group_id: safeQqId(params.groupId, "groupId"),
     enable: params.enable,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -266,7 +391,7 @@ export async function setGroupWholeBan(params: {
   }
 }
 
-// Reactions support (requires napcat/LLOneBot extended API)
+// Reactions support
 
 export async function addReaction(params: {
   cfg: { channels?: { qq?: unknown } };
@@ -275,12 +400,23 @@ export async function addReaction(params: {
   emojiId: string;
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // DEBUG: log accountId
+  console.log(`[DEBUG] addReaction called with params.accountId=${params.accountId}, resolvedAccountId=${resolvedAccountId}, activeClients keys=${JSON.stringify([...activeClients.keys()])}`);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setMsgEmojiLike(safeQqId(params.messageId, "messageId"), params.emojiId);
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_msg_emoji_like", {
-    message_id: Number(params.messageId),
+    message_id: safeQqId(params.messageId, "messageId"),
     emoji_id: params.emojiId,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
@@ -295,16 +431,72 @@ export async function removeReaction(params: {
   emojiId: string;
 }): Promise<void> {
   const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    await nativeClient.client.setMsgEmojiLike(
+      safeQqId(params.messageId, "messageId"),
+      params.emojiId,
+      false,
+    );
+    return;
+  }
+
   const client = getActiveQqClient(resolvedAccountId);
   if (!client) {
     throw new Error(`QQ client not running for account ${resolvedAccountId}`);
   }
   const response = await client.sendAction("set_msg_emoji_like", {
-    message_id: Number(params.messageId),
+    message_id: safeQqId(params.messageId, "messageId"),
     emoji_id: params.emojiId,
     set: false,
   });
   if (response.status !== "ok" && response.retcode !== 0) {
     throw new Error(response.msg ?? `Failed to remove reaction: retcode=${response.retcode}`);
+  }
+}
+
+/** Send a sticker (QQ face/emoji). */
+export async function sendSticker(params: {
+  cfg: { channels?: { qq?: unknown } };
+  accountId?: string;
+  targetId: string;
+  stickerId: string;
+}): Promise<void> {
+  const resolvedAccountId =
+    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+
+  // Parse target to determine if group or private
+  const target = parseQqTarget(params.targetId);
+  if (!target) {
+    throw new Error(`Invalid QQ target: ${params.targetId}`);
+  }
+
+  // Try native client first, then OB11
+  const nativeClient = getActiveNativeClient(resolvedAccountId);
+  if (nativeClient) {
+    // oicq uses sendGroupMsg with CQ code for stickers
+    const cqCode = `[CQ:sticker,id=${params.stickerId}]`;
+    if (target.kind === "group") {
+      await nativeClient.client.sendGroupMsg(safeQqId(target.id, "groupId"), cqCode);
+    } else {
+      await nativeClient.client.sendPrivateMsg(safeQqId(target.id, "userId"), cqCode);
+    }
+    return;
+  }
+
+  const client = getActiveQqClient(resolvedAccountId);
+  if (!client) {
+    throw new Error(`QQ client not running for account ${resolvedAccountId}`);
+  }
+  const response = await client.sendAction(
+    target.kind === "group" ? "send_group_msg" : "send_private_msg",
+    target.kind === "group"
+      ? { group_id: safeQqId(target.id, "groupId"), message: `[CQ:sticker,id=${params.stickerId}]` }
+      : { user_id: safeQqId(target.id, "userId"), message: `[CQ:sticker,id=${params.stickerId}]` },
+  );
+  if (response.status !== "ok" && response.retcode !== 0) {
+    throw new Error(response.msg ?? `Failed to send sticker: retcode=${response.retcode}`);
   }
 }

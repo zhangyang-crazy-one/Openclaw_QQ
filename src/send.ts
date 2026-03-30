@@ -16,11 +16,10 @@ function getExtension(url: string): string {
   return dotIndex >= 0 ? clean.slice(dotIndex) : "";
 }
 
-function guessMediaType(path: string): "image" | "record" | "video" | "file" {
+function guessMediaType(path: string): "image" | "record" | "video" {
   const ext = getExtension(path);
   if (AUDIO_EXTENSIONS.has(ext)) return "record";
   if (VIDEO_EXTENSIONS.has(ext)) return "video";
-  if (FILE_EXTENSIONS.has(ext)) return "file";
   if (IMAGE_EXTENSIONS.has(ext)) return "image";
   return "image";
 }
