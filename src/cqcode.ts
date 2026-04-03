@@ -125,7 +125,7 @@ export function buildCqMessage(params: {
   text?: string;
   replyToId?: string;
   mediaUrl?: string;
-  mediaType?: "image" | "record" | "video";
+  mediaType?: "image" | "record" | "video" | "file";
 }): string {
   const parts: string[] = [];
   if (params.replyToId) {
