@@ -13,6 +13,7 @@ import {
 import type {
   OB11ActionResponse,
   OB11Event,
+  OB11GroupUploadNoticeEvent,
   OB11MessageSegment,
   ResolvedQQAccount,
 } from "./types.js";
@@ -599,6 +600,13 @@ export async function handleOb11Event(params: {
   const { event, account, config, runtime, statusSink } = params;
 
   try {
+    // Step 0: Handle notice events (file uploads) separately
+    const postType = String(event.post_type ?? "").toLowerCase();
+    if (postType === "notice") {
+      await handleNoticeEvent({ event, account, config, runtime, statusSink });
+      return;
+    }
+
     // Step 1: Validate event and extract basic info
     const validation = validateInboundEvent({ event, account });
     if (!validation) {
@@ -788,4 +796,242 @@ export async function handleOb11Event(params: {
     runtime.error?.(`qq handleOb11Event error: ${String(err)}`);
     throw err;
   }
+}
+
+/**
+ * Handle OneBot 11 notice events related to file uploads.
+ *
+ * QQ sends files via two notice types:
+ * - group_upload: A user uploaded a file to a group
+ * - offline_file: A user sent a file in private chat
+ *
+ * These events have post_type="notice" and were previously silently dropped.
+ */
+async function handleNoticeEvent(params: {
+  event: OB11Event;
+  account: ResolvedQQAccount;
+  config: OpenClawConfig;
+  runtime: RuntimeEnv;
+  statusSink?: StatusSink;
+}): Promise<void> {
+  const { event, account, config, runtime, statusSink } = params;
+  const noticeType = String(event.notice_type ?? "").toLowerCase();
+
+  if (noticeType !== "group_upload" && noticeType !== "offline_file") {
+    return;
+  }
+
+  // Extract file info from the notice event
+  const file = event.file as { id?: string; name?: string; url?: string; size?: number } | undefined;
+  if (!file?.url && !file?.name) {
+    runtime.log?.(`qq: notice ${noticeType} has no file info, skipping`);
+    return;
+  }
+
+  const fileUrl = file.url || "";
+  const fileName = file.name || "unknown_file";
+  const fileSize = file.size;
+
+  const isGroup = noticeType === "group_upload";
+  const senderId = event.user_id != null ? String(event.user_id) : "";
+  if (!senderId) {
+    return;
+  }
+
+  const groupId = event.group_id != null ? String(event.group_id) : undefined;
+  if (isGroup && !groupId) {
+    return;
+  }
+
+  const target: QQTarget = isGroup
+    ? { kind: "group", id: groupId! }
+    : { kind: "private", id: senderId };
+
+  const timestamp = typeof event.time === "number" ? event.time * 1000 : Date.now();
+  statusSink?.({ lastInboundAt: timestamp });
+
+  // Access control for groups
+  if (isGroup) {
+    const groupConfig = resolveGroupConfig(account.config, groupId!);
+    if (!groupConfig?.enabled) {
+      runtime.log?.(`qq: drop group file ${groupId} (group disabled in config)`);
+      return;
+    }
+    const defaultGroupPolicy = config.channels?.defaults?.groupPolicy;
+    const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
+    if (groupPolicy === "disabled") {
+      runtime.log?.(`qq: drop group file ${groupId} (groupPolicy=disabled)`);
+      return;
+    }
+    if (groupPolicy === "allowlist") {
+      const configGroupAllowFrom = normalizeAllowList(account.config.groupAllowFrom);
+      const groupKey = `group:${groupId}`;
+      if (!isAllowed(configGroupAllowFrom, groupKey)) {
+        runtime.log?.(`qq: drop group file ${groupId} (not allowlisted)`);
+        return;
+      }
+    }
+  } else {
+    // DM access control
+    const dmPolicy = account.config.dmPolicy ?? "pairing";
+    if (dmPolicy === "disabled") {
+      runtime.log?.(`qq: drop DM file sender=${senderId} (dmPolicy=disabled)`);
+      return;
+    }
+    const effectiveAllowFrom = normalizeAllowList(account.config.allowFrom);
+    const senderAllowed = isAllowed(effectiveAllowFrom, senderId);
+    if (dmPolicy !== "open" && !senderAllowed) {
+      runtime.log?.(`qq: drop DM file sender=${senderId} (dmPolicy=${dmPolicy})`);
+      return;
+    }
+  }
+
+  const core = getQqRuntime();
+
+  // Build the file description message for the agent
+  const sizeInfo = fileSize ? ` (${formatFileSize(fileSize)})` : "";
+  const fileDescription = `[File received: ${fileName}${sizeInfo}]`;
+  const fileUrlInfo = fileUrl ? `URL: ${fileUrl}` : "(no download URL available)";
+  const fullBody = `${fileDescription}\n${fileUrlInfo}`;
+
+  const route = core.channel?.routing?.resolveAgentRoute({
+    cfg: config as OpenClawConfig,
+    channel: CHANNEL_ID,
+    accountId: account.accountId,
+    peer: {
+      kind: isGroup ? "group" : "direct",
+      id: isGroup ? groupId! : senderId,
+    },
+  }) ?? { agentId: "default", sessionKey: "" };
+
+  const groupConfig = isGroup ? resolveGroupConfig(account.config, groupId!) : null;
+  const effectiveAgentId = groupConfig?.agentId ?? route.agentId;
+
+  const fromLabel = isGroup ? `group:${groupId}` : `user:${senderId}`;
+
+  const storePath = core.channel?.session?.resolveStorePath(config.session?.store, {
+    agentId: effectiveAgentId,
+  }) ?? "";
+  const envelopeOptions = core.channel?.reply?.resolveEnvelopeFormatOptions(config as OpenClawConfig) ?? {};
+  const previousTimestamp = core.channel?.session?.readSessionUpdatedAt({
+    storePath,
+    sessionKey: route.sessionKey,
+  }) ?? Date.now();
+
+  const mediaUrls = fileUrl ? [fileUrl] : [];
+
+  const body = core.channel?.reply?.formatAgentEnvelope({
+    channel: "QQ",
+    from: fromLabel,
+    timestamp,
+    previousTimestamp,
+    envelope: envelopeOptions,
+    body: fullBody,
+  }) ?? fullBody;
+
+  const ctxPayload = core.channel?.reply?.finalizeInboundContext({
+    Body: body,
+    BodyForAgent: fullBody,
+    RawBody: fullBody,
+    CommandBody: fullBody,
+    From: isGroup ? `qq:group:${groupId}` : `qq:${senderId}`,
+    To: `qq:${formatQqTarget(target)}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isGroup ? "group" : "direct",
+    ConversationLabel: fromLabel,
+    SenderName: undefined,
+    SenderId: senderId,
+    GroupSubject: isGroup ? groupId : undefined,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    WasMentioned: undefined,
+    MessageSid: undefined,
+    Timestamp: timestamp,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: `qq:${formatQqTarget(target)}`,
+    CommandAuthorized: false,
+    MediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
+  });
+
+  if (!ctxPayload) {
+    return;
+  }
+
+  await core.channel?.session?.recordInboundSession({
+    storePath,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    ctx: ctxPayload,
+    onRecordError: (err) => {
+      runtime.error?.(`qq: failed updating session meta for file notice: ${String(err)}`);
+    },
+  });
+
+  await core.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: config as OpenClawConfig,
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        try {
+          const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+
+          // Try native client first, then OB11
+          const nativeClient = getActiveNativeClient(account.accountId);
+          if (nativeClient) {
+            let messageId: string;
+            if (target.kind === "group") {
+              messageId = String(
+                await nativeClient.sendGroupMsg(safeQqId(target.id, "groupId"), payload.text ?? ""),
+              );
+            } else {
+              messageId = String(
+                await nativeClient.sendPrivateMsg(safeQqId(target.id, "userId"), payload.text ?? ""),
+              );
+            }
+            rememberSelfSentResponse({
+              accountId: account.accountId,
+              response: { status: "ok", data: { message_id: messageId } },
+              target: formatQqTarget(target),
+              text: payload.text ?? "",
+            });
+            statusSink?.({ lastOutboundAt: Date.now() });
+            return;
+          }
+
+          // OB11 client path
+          const client = getActiveQqClient(account.accountId);
+          if (!client) {
+            throw new Error(`QQ client not running for account ${account.accountId}`);
+          }
+          const response = await sendOb11Message({
+            client,
+            target,
+            text: payload.text ?? "",
+            mediaUrl,
+          });
+          rememberSelfSentResponse({
+            accountId: account.accountId,
+            response,
+            target: formatQqTarget(target),
+            text: payload.text ?? "",
+          });
+          statusSink?.({ lastOutboundAt: Date.now() });
+        } catch (err) {
+          throw err;
+        }
+      },
+      onError: (err, info) => {
+        runtime.error?.(`qq file notice ${info.kind} reply failed: ${String(err)}`);
+      },
+    },
+  }).catch((err) => {
+    runtime.error?.(`qq file notice dispatch exception: ${String(err)}`);
+  });
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
 }

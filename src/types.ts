@@ -107,6 +107,33 @@ export type OB11MessageEvent = {
   sender?: OB11MessageSender;
 };
 
+export type OB11NoticeFile = {
+  id?: string;
+  name?: string;
+  url?: string;
+  size?: number;
+  md5?: string;
+};
+
+export type OB11GroupUploadNoticeEvent = {
+  post_type: "notice";
+  notice_type: "group_upload";
+  group_id?: number;
+  user_id?: number;
+  file?: OB11NoticeFile;
+  self_id?: number;
+  time?: number;
+};
+
+export type OB11OfflineFileNoticeEvent = {
+  post_type: "notice";
+  notice_type: "offline_file";
+  user_id?: number;
+  file?: OB11NoticeFile;
+  self_id?: number;
+  time?: number;
+};
+
 export type OB11Event = OB11MessageEvent & Record<string, unknown>;
 
 export type OB11ActionResponse<T = unknown> = {
