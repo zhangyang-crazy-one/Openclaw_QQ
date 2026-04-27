@@ -888,11 +888,81 @@ async function handleNoticeEvent(params: {
 
   const core = getQqRuntime();
 
+  // Step 1: Resolve the actual file source via OneBot get_file API
+  // The file.url from notice events is often empty or has a short-lived token.
+  // We need to use get_file with file.id to get the actual local path or download URL.
+  const fileId = file.id || fileUrl;
+  let resolvedSource: string | null = null;
+
+  if (fileId) {
+    // Try OneBot get_file API first
+    const ob11Client = getActiveQqClient(account.accountId);
+    if (ob11Client) {
+      try {
+        const response = await ob11Client.sendAction("get_file", {
+          file: fileId,
+        });
+        if (isOb11ActionSuccess(response)) {
+          const extracted = extractMediaSourceFromActionData(response.data);
+          if (extracted) {
+            resolvedSource = extracted;
+            runtime.log?.(`qq: resolved file via get_file: ${resolvedSource}`);
+          }
+        }
+      } catch (err) {
+        runtime.log?.(`qq: get_file failed for ${fileId}: ${String(err)}`);
+      }
+    }
+
+    // Fallback: try native client if available
+    if (!resolvedSource) {
+      const nativeClient = getActiveNativeClient(account.accountId);
+      if (nativeClient) {
+        try {
+          const nativeResult = await nativeClient.getFile(fileId);
+          if (nativeResult) {
+            resolvedSource = String(nativeResult);
+            runtime.log?.(`qq: resolved file via native client: ${resolvedSource}`);
+          }
+        } catch (err) {
+          runtime.log?.(`qq: native getFile failed for ${fileId}: ${String(err)}`);
+        }
+      }
+    }
+  }
+
+  // Fallback to the original URL from the notice event
+  if (!resolvedSource) {
+    resolvedSource = fileUrl || null;
+  }
+
+  // Step 2: Download the file to local storage if possible
+  let localFilePath: string | null = null;
+  if (resolvedSource) {
+    try {
+      localFilePath = await resolveInboundMediaUrl({
+        source: resolvedSource,
+        fileNameHint: fileName,
+        runtime,
+      });
+    } catch (err) {
+      runtime.log?.(`qq: failed to download file ${resolvedSource}: ${String(err)}`);
+    }
+  }
+
+  const effectiveFilePath = localFilePath || resolvedSource;
+
   // Build the file description message for the agent
   const sizeInfo = fileSize ? ` (${formatFileSize(fileSize)})` : "";
   const fileDescription = `[File received: ${fileName}${sizeInfo}]`;
-  const fileUrlInfo = fileUrl ? `URL: ${fileUrl}` : "(no download URL available)";
-  const fullBody = `${fileDescription}\n${fileUrlInfo}`;
+  const filePathInfo = effectiveFilePath
+    ? (localFilePath && localFilePath !== resolvedSource
+      ? `Local: ${localFilePath}\nSource: ${resolvedSource}`
+      : `URL: ${effectiveFilePath}`)
+    : "(file could not be downloaded — no accessible URL or local path)";
+  const fullBody = `${fileDescription}\n${filePathInfo}`;
+
+  const mediaUrls = effectiveFilePath ? [effectiveFilePath] : [];
 
   const route = core.channel?.routing?.resolveAgentRoute({
     cfg: config as OpenClawConfig,
@@ -917,8 +987,6 @@ async function handleNoticeEvent(params: {
     storePath,
     sessionKey: route.sessionKey,
   }) ?? Date.now();
-
-  const mediaUrls = fileUrl ? [fileUrl] : [];
 
   const body = core.channel?.reply?.formatAgentEnvelope({
     channel: "QQ",
