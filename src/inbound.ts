@@ -320,8 +320,7 @@ async function collectInboundMedia(params: {
       mediaInfoLines.push(`[Voice: ${resolved}]`);
       continue;
     }
-    const displayName = fileNameHint || "file";
-    mediaInfoLines.push(`[File: ${displayName}]`);
+    mediaInfoLines.push(`[File: ${resolved}]`);
   }
 
   return {
