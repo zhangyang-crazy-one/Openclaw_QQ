@@ -1,18 +1,13 @@
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
 import type { ChannelOutboundContext } from "openclaw/plugin-sdk/twitch";
+import { getActiveQqClient } from "./adapter.js";
+import { resolveDefaultQqAccountId, resolveQqAccount } from "./config.js";
+import { getActiveNativeClient } from "./qq-native.js";
+import { getQqRuntime } from "./runtime.js";
 import type { ChannelOutboundTargetMode } from "./sdk-compat.js";
 import { DEFAULT_ACCOUNT_ID, type OutboundDeliveryResult } from "./sdk-compat.js";
-import type { OB11ActionResponse } from "./types.js";
-import { getActiveQqClient } from "./adapter.js";
-import { getActiveNativeClient } from "./qq-native.js";
-import { resolveDefaultQqAccountId, resolveQqAccount } from "./config.js";
-import { getQqRuntime } from "./runtime.js";
-import { extractMessageIdFromResponse, rememberSelfSentResponse } from "./self-sent.js";
-import { sendOb11Message } from "./send.js";
 import { formatQqTarget, normalizeAllowEntry, parseQqTarget, type QQTarget } from "./targets.js";
-function resolveMessageId(response: OB11ActionResponse): string {
-  return extractMessageIdFromResponse(response) ?? String(Date.now());
-}
+import { sendQqMessage } from "./native-ob11-bridge.js";
 
 /**
  * Safely convert a value to a QQ ID (positive integer).
@@ -99,63 +94,19 @@ async function sendMessage(params: {
     throw targetResult.error;
   }
 
-  // Try native oicq client first, then fall back to OB11 client
-  const nativeClient = getActiveNativeClient(account.accountId);
-  if (nativeClient) {
-    // Native oicq client path
-    const target = targetResult.target;
-    let messageId: string;
-
-    if (target.kind === "group") {
-      messageId = String(
-        await nativeClient.sendGroupMsg(safeQqId(target.id, "groupId"), text ?? ""),
-      );
-    } else {
-      messageId = String(
-        await nativeClient.sendPrivateMsg(safeQqId(target.id, "userId"), text ?? ""),
-      );
-    }
-
-    rememberSelfSentResponse({
-      accountId: account.accountId,
-      response: { status: "ok", data: { message_id: messageId } },
-      target: formatQqTarget(target),
-      text: text ?? "",
-    });
-
-    return {
-      channel: "qq",
-      messageId,
-      timestamp: Date.now(),
-      chatId: formatQqTarget(target),
-    };
-  }
-
-  // OB11 client path (external bot service)
-  const client = getActiveQqClient(account.accountId);
-  if (!client) {
-    throw new Error(`QQ client not running for account ${account.accountId}`);
-  }
-
-  const response = await sendOb11Message({
-    client,
+  const result = await sendQqMessage({
+    account,
     target: targetResult.target,
-    text,
-    replyToId: replyToId ?? undefined,
+    text: text ?? "",
     mediaUrl: params.mediaUrl,
-  });
-  rememberSelfSentResponse({
-    accountId: account.accountId,
-    response,
-    target: formatQqTarget(targetResult.target),
-    text,
+    replyToId: replyToId ?? undefined,
   });
 
   return {
     channel: "qq",
-    messageId: resolveMessageId(response),
+    messageId: result.messageId,
     timestamp: Date.now(),
-    chatId: formatQqTarget(targetResult.target),
+    chatId: result.chatId,
   };
 }
 
@@ -182,7 +133,8 @@ export async function editMessage(params: {
   newText: string;
 }): Promise<void> {
   const resolvedAccountId =
-    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -211,7 +163,8 @@ export async function deleteQqMessage(params: {
   messageId: string | number;
 }): Promise<void> {
   const resolvedAccountId =
-    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -239,7 +192,9 @@ export async function muteUser(params: {
   userId: string;
   duration: number; // seconds, 0 = unmute
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -273,7 +228,9 @@ export async function kickUser(params: {
   userId: string;
   rejectAdd?: boolean;
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -307,7 +264,8 @@ export async function setGroupName(params: {
   name: string;
 }): Promise<void> {
   const resolvedAccountId =
-    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -336,7 +294,9 @@ export async function setGroupCard(params: {
   userId: string;
   card: string;
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -369,7 +329,9 @@ export async function setGroupWholeBan(params: {
   groupId: string;
   enable: boolean;
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -399,15 +361,17 @@ export async function addReaction(params: {
   messageId: string;
   emojiId: string;
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
-
-  // DEBUG: log accountId
-  console.log(`[DEBUG] addReaction called with params.accountId=${params.accountId}, resolvedAccountId=${resolvedAccountId}, activeClients keys=${JSON.stringify([...activeClients.keys()])}`);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
   if (nativeClient) {
-    await nativeClient.client.setMsgEmojiLike(safeQqId(params.messageId, "messageId"), params.emojiId);
+    await nativeClient.client.setMsgEmojiLike(
+      safeQqId(params.messageId, "messageId"),
+      params.emojiId,
+    );
     return;
   }
 
@@ -430,7 +394,9 @@ export async function removeReaction(params: {
   messageId: string;
   emojiId: string;
 }): Promise<void> {
-  const resolvedAccountId = params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+  const resolvedAccountId =
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Try native client first, then OB11
   const nativeClient = getActiveNativeClient(resolvedAccountId);
@@ -465,7 +431,8 @@ export async function sendSticker(params: {
   stickerId: string;
 }): Promise<void> {
   const resolvedAccountId =
-    params.accountId ?? resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
+    params.accountId ??
+    resolveDefaultQqAccountId(params.cfg as Parameters<typeof resolveDefaultQqAccountId>[0]);
 
   // Parse target to determine if group or private
   const target = parseQqTarget(params.targetId);

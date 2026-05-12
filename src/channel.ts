@@ -1,7 +1,26 @@
 import type { ChannelPlugin, RuntimeLogger } from "openclaw/plugin-sdk";
 import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
 import type { ChannelSetupInput } from "openclaw/plugin-sdk";
+import { qqMessageActions } from "./actions.js";
+import type { Ob11Client } from "./adapter.js";
+import { clearActiveQqClient, getActiveQqClient, startQqClient } from "./adapter.js";
 import { qqSetupWizard } from "./channel.setup.js";
+import { QQConfigSchema } from "./config-schema.js";
+import {
+  isConnectionConfigured,
+  listQqAccountIds,
+  resolveConnectionIssue,
+  resolveDefaultQqAccountId,
+  resolveQqAccount,
+} from "./config.js";
+import { handleOb11Event } from "./inbound.js";
+import { qqOutbound } from "./outbound.js";
+import {
+  clearActiveNativeClient,
+  getActiveNativeClient,
+  startQqNativeClient,
+} from "./qq-native.js";
+import { setQqRuntime } from "./runtime.js";
 import type { ChannelDirectoryEntry, ChannelLogSink } from "./sdk-compat.js";
 import {
   DEFAULT_ACCOUNT_ID,
@@ -14,29 +33,15 @@ import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,
 } from "./sdk-compat.js";
-import type { Ob11Client } from "./adapter.js";
-import type { OB11ActionResponse, QQConnectionConfig, QQNativeConnectionConfig, ResolvedQQAccount } from "./types.js";
-import { clearActiveQqClient, getActiveQqClient, startQqClient } from "./adapter.js";
-import {
-  clearActiveNativeClient,
-  getActiveNativeClient,
-  startQqNativeClient,
-} from "./qq-native.js";
-import { QQConfigSchema } from "./config-schema.js";
-import {
-  isConnectionConfigured,
-  listQqAccountIds,
-  resolveConnectionIssue,
-  resolveDefaultQqAccountId,
-  resolveQqAccount,
-} from "./config.js";
-import { handleOb11Event } from "./inbound.js";
-import { qqOutbound } from "./outbound.js";
-import { qqMessageActions } from "./actions.js";
-import { setQqRuntime } from "./runtime.js";
 import { rememberSelfSentResponse } from "./self-sent.js";
 import { sendOb11Message } from "./send.js";
 import { formatQqTarget, normalizeAllowEntry, parseQqTarget } from "./targets.js";
+import type {
+  OB11ActionResponse,
+  QQConnectionConfig,
+  QQNativeConnectionConfig,
+  ResolvedQQAccount,
+} from "./types.js";
 
 const CHANNEL_ID = "qq";
 
@@ -79,9 +84,15 @@ function resolveConnectionBaseUrl(connection?: QQConnectionConfig): string | und
 function resolveLogger(runtime: RuntimeEnv, log?: ChannelLogSink): RuntimeLogger {
   if (log) {
     return {
-      info: log.info ? (message: string) => log.info!(message) : (message: string) => runtime.log(message),
-      warn: log.warn ? (message: string) => log.warn!(message) : (message: string) => runtime.log(message),
-      error: log.error ? (message: string) => log.error!(message) : (message: string) => runtime.error(message),
+      info: log.info
+        ? (message: string) => log.info!(message)
+        : (message: string) => runtime.log(message),
+      warn: log.warn
+        ? (message: string) => log.warn!(message)
+        : (message: string) => runtime.log(message),
+      error: log.error
+        ? (message: string) => log.error!(message)
+        : (message: string) => runtime.error(message),
       debug: log.debug ? (message: string) => log.debug!(message) : undefined,
     };
   }
@@ -231,7 +242,9 @@ function requireActiveClient(params: { cfg: OpenClawConfig; accountId?: string |
 }
 
 /** Get the logged-in user's info from either native or OB11 client. */
-async function getSelfInfoFromClient(accountId: string): Promise<{ userId: number; nickname?: string } | null> {
+async function getSelfInfoFromClient(
+  accountId: string,
+): Promise<{ userId: number; nickname?: string } | null> {
   // Try native client first
   const { getActiveNativeClient } = await import("./qq-native.js");
   const nativeClient = getActiveNativeClient(accountId);
@@ -259,7 +272,9 @@ async function getSelfInfoFromClient(accountId: string): Promise<{ userId: numbe
 }
 
 /** Get friend list from either native or OB11 client. */
-async function getFriendListFromClient(accountId: string): Promise<Array<{ userId: number; nickname?: string; remark?: string }>> {
+async function getFriendListFromClient(
+  accountId: string,
+): Promise<Array<{ userId: number; nickname?: string; remark?: string }>> {
   // Try native client first
   const { getActiveNativeClient } = await import("./qq-native.js");
   const nativeClient = getActiveNativeClient(accountId);
@@ -289,7 +304,9 @@ async function getFriendListFromClient(accountId: string): Promise<Array<{ userI
 }
 
 /** Get group list from either native or OB11 client. */
-async function getGroupListFromClient(accountId: string): Promise<Array<{ groupId: number; groupName?: string }>> {
+async function getGroupListFromClient(
+  accountId: string,
+): Promise<Array<{ groupId: number; groupName?: string }>> {
   // Try native client first
   const { getActiveNativeClient } = await import("./qq-native.js");
   const nativeClient = getActiveNativeClient(accountId);
@@ -363,6 +380,11 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
     nativeCommands: true,
     groupManagement: true,
     blockStreaming: true,
+    blockStreamingCoalesce: {
+      minChars: 50,
+      maxChars: 500,
+      idleMs: 200,
+    },
   },
   reload: { configPrefixes: ["channels.qq"] },
   configSchema: buildChannelConfigSchema(QQConfigSchema),
@@ -615,7 +637,7 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
     },
   },
   setupWizard: qqSetupWizard,
-    gateway: {
+  gateway: {
     startAccount: async (ctx) => {
       const account = ctx.account;
       const connection = account.connection;
@@ -628,69 +650,109 @@ export const qqPlugin: ChannelPlugin<ResolvedQQAccount> = {
       if (connection.type === "native") {
         // Native oicq client (no external bot service needed)
         const nativeConfig = connection as QQNativeConnectionConfig;
-        logger.info(`[${account.accountId}] Starting QQ native client for uin ${nativeConfig.uin}`);
-
         const isQrLogin = nativeConfig.qrLogin ?? !nativeConfig.password;
 
-        await startQqNativeClient({
-          accountId: account.accountId,
-          config: {
-            uin: nativeConfig.uin,
-            password: nativeConfig.password,
-            qrLogin: isQrLogin,
-            platform: nativeConfig.platform,
-            dataDir: nativeConfig.dataDir,
-          },
-          abortSignal: ctx.abortSignal,
-          callbacks: {
-            log: logger,
-            onEvent: (event) =>
-              handleOb11Event({
-                event,
-                account,
-                config: ctx.cfg,
-                runtime: ctx.runtime,
-                statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
-              }),
-            onLoginSuccess: (userId) => {
-              logger.info(`[${account.accountId}] QQ native login success: ${userId}`);
-            },
-            onQrCode: async (data) => {
-              logger.info(`[${account.accountId}] QR code received (url: ${data.url ?? "none"})`);
+        let retryCount = 0;
+        const MAX_RETRIES = 50;
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-              // If QR login, trigger TUI to display QR code and wait for completion
-              if (isQrLogin) {
-                try {
-                  const { runNativeLoginTui } = await import("./qq-tui-impl.js");
-                  await runNativeLoginTui(
-                    account.accountId,
-                    ctx.runtime,
-                    (userId) => {
-                      logger.info(`[${account.accountId}] User ${userId} logged in via QR`);
-                      ctx.setStatus({ accountId: account.accountId, lastStartAt: Date.now() });
-                    },
-                    (reason) => {
-                      logger.error(`[${account.accountId}] QR login failed: ${reason ?? "unknown"}`);
-                    },
-                  );
-                } catch (err) {
-                  logger.error(`[${account.accountId}] Failed to start TUI: ${String(err)}`);
+        const startNativeLogin = async () => {
+          if (ctx.abortSignal.aborted) return;
+
+          logger.info(
+            `[${account.accountId}] Starting QQ native client for uin ${nativeConfig.uin}` +
+              (retryCount > 0 ? ` (retry ${retryCount})` : ""),
+          );
+
+          // Clean up previous client before retrying
+          if (retryCount > 0) {
+            clearActiveNativeClient(account.accountId);
+          }
+
+          await startQqNativeClient({
+            accountId: account.accountId,
+            config: {
+              uin: nativeConfig.uin,
+              password: nativeConfig.password,
+              qrLogin: isQrLogin,
+              platform: nativeConfig.platform,
+              dataDir: nativeConfig.dataDir,
+            },
+            abortSignal: ctx.abortSignal,
+            callbacks: {
+              log: logger,
+              onEvent: (event) =>
+                handleOb11Event({
+                  event,
+                  account,
+                  config: ctx.cfg,
+                  runtime: ctx.runtime,
+                  statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+                }),
+              onLoginSuccess: (userId) => {
+                retryCount = 0;
+                logger.info(`[${account.accountId}] QQ native login success: ${userId}`);
+              },
+              onQrCode: async (data) => {
+                logger.info(`[${account.accountId}] QR code received (url: ${data.url ?? "none"})`);
+
+                // If QR login, trigger TUI to display QR code and wait for completion
+                if (isQrLogin) {
+                  try {
+                    const { runNativeLoginTui } = await import("./qq-tui-impl.js");
+                    await runNativeLoginTui(
+                      account.accountId,
+                      ctx.runtime,
+                      (userId) => {
+                        retryCount = 0;
+                        logger.info(`[${account.accountId}] User ${userId} logged in via QR`);
+                        ctx.setStatus({ accountId: account.accountId, lastStartAt: Date.now() });
+                      },
+                      (reason) => {
+                        logger.error(
+                          `[${account.accountId}] QR login failed: ${reason ?? "unknown"}`,
+                        );
+                        // QR expired or scan timed out — retry with fresh QR
+                        if (ctx.abortSignal.aborted || retryCount >= MAX_RETRIES) return;
+                        retryCount++;
+                        const delay = Math.min(2000 * Math.pow(1.5, retryCount - 1), 30000);
+                        logger.info(
+                          `[${account.accountId}] Will retry login in ${Math.round(delay / 1000)}s (attempt ${retryCount}/${MAX_RETRIES})`,
+                        );
+                        retryTimer = setTimeout(startNativeLogin, delay);
+                      },
+                    );
+                  } catch (err) {
+                    logger.error(`[${account.accountId}] Failed to start TUI: ${String(err)}`);
+                  }
                 }
-              }
+              },
+              onLoginError: (message) => {
+                logger.error(`[${account.accountId}] QQ native login error: ${message}`);
+                if (ctx.abortSignal.aborted || retryCount >= MAX_RETRIES) return;
+                retryCount++;
+                const delay = Math.min(2000 * Math.pow(1.5, retryCount - 1), 30000);
+                logger.info(
+                  `[${account.accountId}] Will retry login in ${Math.round(delay / 1000)}s (attempt ${retryCount}/${MAX_RETRIES})`,
+                );
+                retryTimer = setTimeout(startNativeLogin, delay);
+              },
+              onDisconnect: (reason) => {
+                logger.warn(`[${account.accountId}] QQ native disconnected: ${reason}`);
+              },
             },
-            onLoginError: (message) => {
-              logger.error(`[${account.accountId}] QQ native login error: ${message}`);
-            },
-            onDisconnect: (reason) => {
-              logger.warn(`[${account.accountId}] QQ native disconnected: ${reason}`);
-            },
-          },
-        });
+          });
 
-        logger.info(`[${account.accountId}] QQ native client started`);
+          logger.info(`[${account.accountId}] QQ native client started`);
+        };
+
+        await startNativeLogin();
 
         // Keep startAccount from resolving so gateway doesn't think channel exited.
-        // The client runs in background and reconnect is handled by adapter.ts close handlers.
+        ctx.abortSignal.addEventListener("abort", () => {
+          if (retryTimer !== null) clearTimeout(retryTimer);
+        });
+
         await new Promise(() => {});
       } else {
         // OB11 client (ws/http) - external bot service required

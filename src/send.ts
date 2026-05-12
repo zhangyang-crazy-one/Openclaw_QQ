@@ -1,12 +1,28 @@
 import type { Ob11Client } from "./adapter.js";
+import { buildCqMessage } from "./cqcode.js";
 import type { QQTarget } from "./targets.js";
 import type { QQMessageFormat, OB11ActionResponse, OB11MessageSegment } from "./types.js";
-import { buildCqMessage } from "./cqcode.js";
 
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"]);
 const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg", ".flac", ".silk", ".m4a"]);
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".mkv", ".avi"]);
-const FILE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".7z", ".tar", ".gz", ".txt", ".csv", ".json"]);
+const FILE_EXTENSIONS = new Set([
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".zip",
+  ".rar",
+  ".7z",
+  ".tar",
+  ".gz",
+  ".txt",
+  ".csv",
+  ".json",
+]);
 
 function getExtension(url: string): string {
   const lower = url.toLowerCase();
@@ -36,7 +52,7 @@ export function buildOb11MessagePayload(params: {
   mediaUrl?: string;
 }): string | OB11MessageSegment[] {
   const mediaType = params.mediaUrl ? guessMediaType(params.mediaUrl) : undefined;
-  
+
   if (params.format === "string") {
     return buildCqMessage({
       text: params.text,
@@ -45,21 +61,21 @@ export function buildOb11MessagePayload(params: {
       mediaType,
     });
   }
-  
+
   const segments: OB11MessageSegment[] = [];
-  
+
   if (params.replyToId) {
     segments.push({ type: "reply", data: { id: params.replyToId } });
   }
-  
+
   if (params.text) {
     segments.push({ type: "text", data: { text: params.text } });
   }
-  
+
   if (params.mediaUrl) {
     segments.push({ type: mediaType || "image", data: { file: params.mediaUrl } });
   }
-  
+
   return segments;
 }
 
@@ -78,9 +94,7 @@ export async function sendOb11Message(params: {
     // 使用 CQ码 方式发送本地文件
     const cqCode = `[CQ:${mediaType},file=${params.mediaUrl}]`;
 
-    const fullMessage = params.text
-      ? `${params.text}\n${cqCode}`
-      : cqCode;
+    const fullMessage = params.text ? `${params.text}\n${cqCode}` : cqCode;
 
     if (params.target.kind === "group") {
       return params.client.sendAction("send_group_msg", {
@@ -88,13 +102,13 @@ export async function sendOb11Message(params: {
         message: fullMessage,
       });
     }
-    
+
     return params.client.sendAction("send_private_msg", {
       user_id: params.target.id,
       message: fullMessage,
     });
   }
-  
+
   // 普通消息或远程媒体
   const payload = buildOb11MessagePayload({
     format: params.client.messageFormat,

@@ -1,5 +1,17 @@
-import type { OB11MessageSegment } from "./types.js";
 import { parseCqSegments, renderCqSegments } from "./cqcode.js";
+import type { OB11MessageSegment } from "./types.js";
+
+/**
+ * Safely convert a value to a QQ ID (positive integer).
+ * Throws if the value is not a valid positive number.
+ */
+export function safeQqId(value: string | number, _fieldName?: string): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
+    throw new Error(`Invalid QQ ID: ${JSON.stringify(value)}`);
+  }
+  return num;
+}
 
 export type ParsedMessage = {
   text: string;

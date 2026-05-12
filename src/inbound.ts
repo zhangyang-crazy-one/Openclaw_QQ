@@ -2,14 +2,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
-import {
-  logInboundDrop,
-  resolveControlCommandGate,
-} from "openclaw/plugin-sdk/irc";
-import {
-  mergeAllowlist,
-  resolveMentionGatingWithBypass,
-} from "openclaw/plugin-sdk/zalouser";
+import { logInboundDrop, resolveControlCommandGate } from "openclaw/plugin-sdk/irc";
+import { mergeAllowlist, resolveMentionGatingWithBypass } from "openclaw/plugin-sdk/zalouser";
+import { getActiveQqClient } from "./adapter.js";
+import { resolveGroupConfig } from "./config.js";
+import { convertBareImageUrlsToCq, convertMarkdownImagesToCq, parseCqSegments } from "./cqcode.js";
+import { convertMarkdownToQQ } from "./markdown-formatter.js";
+import { createSendQueue } from "./message-queue.js";
+import { parseOb11Message, hasSelfMention } from "./message-utils.js";
+import { sendQqMessage } from "./native-ob11-bridge.js";
+import { getActiveNativeClient } from "./qq-native.js";
+import { getQqRuntime } from "./runtime.js";
+import { rememberSelfSentResponse, wasSelfSentMessage } from "./self-sent.js";
+import { sendOb11Message } from "./send.js";
+import { formatQqTarget, normalizeAllowEntry, type QQTarget } from "./targets.js";
+import { createDmTypingCallbacks, createToolProgressTracker } from "./typing-feedback.js";
 import type {
   OB11ActionResponse,
   OB11Event,
@@ -17,15 +24,6 @@ import type {
   OB11MessageSegment,
   ResolvedQQAccount,
 } from "./types.js";
-import { getActiveQqClient } from "./adapter.js";
-import { getActiveNativeClient } from "./qq-native.js";
-import { resolveGroupConfig } from "./config.js";
-import { parseCqSegments } from "./cqcode.js";
-import { parseOb11Message, hasSelfMention } from "./message-utils.js";
-import { getQqRuntime } from "./runtime.js";
-import { rememberSelfSentResponse, wasSelfSentMessage } from "./self-sent.js";
-import { sendOb11Message } from "./send.js";
-import { formatQqTarget, normalizeAllowEntry, type QQTarget } from "./targets.js";
 
 const CHANNEL_ID = "qq" as const;
 const QQ_INBOUND_MEDIA_MAX_BYTES = 5 * 1024 * 1024;
@@ -61,24 +59,20 @@ function normalizeAllowList(entries?: Array<string | number>): Allowlist {
 }
 
 function isAllowed(allowlist: Allowlist, id: string): boolean {
-  if (allowlist.hasWildcard) return true;
+  if (allowlist.hasWildcard) {return true;}
   return allowlist.list.includes(id);
 }
 
-function buildTarget(params: {
-  isGroup: boolean;
-  senderId: string;
-  groupId?: string;
-}): QQTarget {
+function buildTarget(params: { isGroup: boolean; senderId: string; groupId?: string }): QQTarget {
   if (params.isGroup) {
-    if (!params.groupId) throw new Error("buildTarget: groupId required for group target");
+    if (!params.groupId) {throw new Error("buildTarget: groupId required for group target");}
     return { kind: "group", id: params.groupId };
   }
   return { kind: "private", id: params.senderId };
 }
 
 function toSegmentString(value: unknown): string {
-  if (value == null) return "";
+  if (value == null) {return "";}
   return String(value).trim();
 }
 
@@ -92,7 +86,7 @@ function isHttpUrl(value: string): boolean {
 }
 
 function resolveLocalMediaPath(value: string): string | null {
-  if (!value) return null;
+  if (!value) {return null;}
   if (value.startsWith("file://")) {
     try {
       return fileURLToPath(value);
@@ -104,25 +98,25 @@ function resolveLocalMediaPath(value: string): string | null {
 }
 
 function isOb11ActionSuccess(response: OB11ActionResponse | undefined): boolean {
-  if (!response) return false;
-  if (response.status && response.status.toLowerCase() === "ok") return true;
-  if (typeof response.retcode === "number") return response.retcode === 0;
+  if (!response) {return false;}
+  if (response.status && response.status.toLowerCase() === "ok") {return true;}
+  if (typeof response.retcode === "number") {return response.retcode === 0;}
   return false;
 }
 
 function extractMediaSourceFromActionData(value: unknown, depth = 0): string | null {
-  if (depth > 4 || value == null) return null;
+  if (depth > 4 || value == null) {return null;}
   if (typeof value === "string") {
     const candidate = value.trim();
-    if (!candidate) return null;
-    if (isHttpUrl(candidate)) return candidate;
-    if (resolveLocalMediaPath(candidate)) return candidate;
+    if (!candidate) {return null;}
+    if (isHttpUrl(candidate)) {return candidate;}
+    if (resolveLocalMediaPath(candidate)) {return candidate;}
     return null;
   }
   if (Array.isArray(value)) {
     for (const entry of value) {
       const matched = extractMediaSourceFromActionData(entry, depth + 1);
-      if (matched) return matched;
+      if (matched) {return matched;}
     }
     return null;
   }
@@ -133,11 +127,11 @@ function extractMediaSourceFromActionData(value: unknown, depth = 0): string | n
   const record = value as Record<string, unknown>;
   for (const key of ["file", "path", "url", "src", "download", "download_url"]) {
     const matched = extractMediaSourceFromActionData(record[key], depth + 1);
-    if (matched) return matched;
+    if (matched) {return matched;}
   }
   for (const nested of Object.values(record)) {
     const matched = extractMediaSourceFromActionData(nested, depth + 1);
-    if (matched) return matched;
+    if (matched) {return matched;}
   }
   return null;
 }
@@ -173,7 +167,7 @@ async function resolveInboundMediaSourceViaOneBot(params: {
   runtime: RuntimeEnv;
 }): Promise<string | null> {
   const client = getActiveQqClient(params.accountId);
-  if (!client) return null;
+  if (!client) {return null;}
 
   const attempts = buildInboundMediaResolutionActions({
     segmentType: params.segmentType,
@@ -186,7 +180,7 @@ async function resolveInboundMediaSourceViaOneBot(params: {
         continue;
       }
       const source = extractMediaSourceFromActionData(response.data);
-      if (source) return source;
+      if (source) {return source;}
     } catch (err) {
       params.runtime.log?.(
         `qq: media action ${attempt.action} failed for ${params.segmentType}: ${String(err)}`,
@@ -202,11 +196,11 @@ async function resolveInboundMediaUrl(params: {
   runtime: RuntimeEnv;
 }): Promise<string> {
   const source = params.source.trim();
-  if (!source) return source;
+  if (!source) {return source;}
 
   const core = getQqRuntime();
   const media = core.channel?.media;
-  if (!media) return source;
+  if (!media) {return source;}
 
   try {
     if (isHttpUrl(source)) {
@@ -250,7 +244,7 @@ function replaceMediaReferences(raw: string, replacements: Map<string, string>):
   }
   let next = raw;
   for (const [from, to] of replacements) {
-    if (!from || !to || from === to) continue;
+    if (!from || !to || from === to) {continue;}
     next = next.split(from).join(to);
   }
   return next;
@@ -267,7 +261,12 @@ async function collectInboundMedia(params: {
   const segments = params.segments ?? [];
 
   for (const seg of segments) {
-    if (seg.type !== "image" && seg.type !== "video" && seg.type !== "record" && seg.type !== "file") {
+    if (
+      seg.type !== "image" &&
+      seg.type !== "video" &&
+      seg.type !== "record" &&
+      seg.type !== "file"
+    ) {
       continue;
     }
 
@@ -280,9 +279,9 @@ async function collectInboundMedia(params: {
       runtime: params.runtime,
     });
     // Prefer local file paths from OneBot payloads when available.
-    const source = oneBotSource || (resolveLocalMediaPath(fileCandidate)
-      ? fileCandidate
-      : (urlCandidate || fileCandidate));
+    const source =
+      oneBotSource ||
+      (resolveLocalMediaPath(fileCandidate) ? fileCandidate : urlCandidate || fileCandidate);
     if (!source) {
       continue;
     }
@@ -320,7 +319,8 @@ async function collectInboundMedia(params: {
       mediaInfoLines.push(`[Voice: ${resolved}]`);
       continue;
     }
-    mediaInfoLines.push(`[File: ${resolved}]`);
+    const displayName = fileNameHint || "file";
+    mediaInfoLines.push(`[File: ${displayName}]`);
   }
 
   return {
@@ -462,24 +462,28 @@ async function checkInboundAccess(params: {
   const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
 
   const configGroupAllowFrom = normalizeAllowList(account.config.groupAllowFrom);
-  const storeAllowFrom = (core.channel?.pairing)
-    ? await core.channel.pairing.readAllowFromStore({ channel: CHANNEL_ID, accountId: account.accountId }).catch(() => [])
+  const storeAllowFrom = core.channel?.pairing
+    ? await core.channel.pairing
+        .readAllowFromStore({ channel: CHANNEL_ID, accountId: account.accountId })
+        .catch(() => [])
     : [];
 
   const effectiveAllowFrom = normalizeAllowList(
     mergeAllowlist({ existing: account.config.allowFrom, additions: storeAllowFrom }),
   );
 
-  const allowTextCommands = core.channel?.commands?.shouldHandleTextCommands({
-    cfg: config as OpenClawConfig,
-    surface: CHANNEL_ID,
-  }) ?? false;
+  const allowTextCommands =
+    core.channel?.commands?.shouldHandleTextCommands({
+      cfg: config,
+      surface: CHANNEL_ID,
+    }) ?? false;
   const useAccessGroups = config.commands?.useAccessGroups !== false;
   const senderAllowedForCommands = isAllowed(
     isGroup ? configGroupAllowFrom : effectiveAllowFrom,
     isGroup ? `group:${groupId ?? ""}` : senderId,
   );
-  const hasControlCommand = core.channel?.text?.hasControlCommand(validation.rawBody, config as OpenClawConfig) ?? false;
+  const hasControlCommand =
+    core.channel?.text?.hasControlCommand(validation.rawBody, config) ?? false;
   const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
@@ -494,7 +498,10 @@ async function checkInboundAccess(params: {
 
   if (isGroup) {
     if (!groupConfig?.enabled) {
-      return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (group disabled in config)` };
+      return {
+        allowed: false,
+        reason: `qq: drop group ${groupId ?? ""} (group disabled in config)`,
+      };
     }
     if (groupPolicy === "disabled") {
       return { allowed: false, reason: `qq: drop group ${groupId ?? ""} (groupPolicy=disabled)` };
@@ -566,11 +573,12 @@ async function handlePairingRequest(params: {
     try {
       const client = getActiveQqClient(account.accountId);
       if (client) {
-        const pairingText = core.channel?.pairing?.buildPairingReply({
-          channel: CHANNEL_ID,
-          idLine: `Your QQ user id: ${senderId}`,
-          code,
-        }) ?? "";
+        const pairingText =
+          core.channel?.pairing?.buildPairingReply({
+            channel: CHANNEL_ID,
+            idLine: `Your QQ user id: ${senderId}`,
+            code,
+          }) ?? "";
         const response = await sendOb11Message({
           client,
           target,
@@ -640,7 +648,7 @@ export async function handleOb11Event(params: {
 
     // Step 4: Resolve routing
     const route = core.channel?.routing?.resolveAgentRoute({
-      cfg: config as OpenClawConfig,
+      cfg: config,
       channel: CHANNEL_ID,
       accountId: account.accountId,
       peer: {
@@ -656,14 +664,17 @@ export async function handleOb11Event(params: {
       ? `group:${validation.groupId ?? ""}`
       : senderName || `user:${validation.senderId}`;
 
-    const storePath = core.channel?.session?.resolveStorePath(config.session?.store, {
-      agentId: effectiveAgentId,
-    }) ?? "";
-    const envelopeOptions = core.channel?.reply?.resolveEnvelopeFormatOptions(config as OpenClawConfig) ?? {};
-    const previousTimestamp = core.channel?.session?.readSessionUpdatedAt({
-      storePath,
-      sessionKey: route.sessionKey,
-    }) ?? Date.now();
+    const storePath =
+      core.channel?.session?.resolveStorePath(config.session?.store, {
+        agentId: effectiveAgentId,
+      }) ?? "";
+    const envelopeOptions =
+      core.channel?.reply?.resolveEnvelopeFormatOptions(config) ?? {};
+    const previousTimestamp =
+      core.channel?.session?.readSessionUpdatedAt({
+        storePath,
+        sessionKey: route.sessionKey,
+      }) ?? Date.now();
 
     // Step 6: Collect and process media
     const media = await collectInboundMedia({
@@ -678,24 +689,29 @@ export async function handleOb11Event(params: {
       ? (normalizedRawBody + "\n" + media.mediaInfo).trim()
       : media.mediaInfo.trim();
 
-    const body = core.channel?.reply?.formatAgentEnvelope({
-      channel: "QQ",
-      from: fromLabel,
-      timestamp,
-      previousTimestamp,
-      envelope: envelopeOptions,
-      body: normalizedRawBody,
-    }) ?? normalizedRawBody;
+    const body =
+      core.channel?.reply?.formatAgentEnvelope({
+        channel: "QQ",
+        from: fromLabel,
+        timestamp,
+        previousTimestamp,
+        envelope: envelopeOptions,
+        body: normalizedRawBody,
+      }) ?? normalizedRawBody;
 
     const selfId = event.self_id != null ? String(event.self_id) : undefined;
-    const wasMentioned = validation.isGroup ? hasSelfMention(validation.parsed.mentions, selfId) : false;
+    const wasMentioned = validation.isGroup
+      ? hasSelfMention(validation.parsed.mentions, selfId)
+      : false;
 
     const ctxPayload = core.channel?.reply?.finalizeInboundContext({
       Body: body,
       BodyForAgent: fullBody,
       RawBody: fullBody,
       CommandBody: fullBody,
-      From: validation.isGroup ? `qq:group:${validation.groupId ?? ""}` : `qq:${validation.senderId}`,
+      From: validation.isGroup
+        ? `qq:group:${validation.groupId ?? ""}`
+        : `qq:${validation.senderId}`,
       To: `qq:${formatQqTarget(validation.target)}`,
       SessionKey: route.sessionKey,
       AccountId: route.accountId,
@@ -728,69 +744,82 @@ export async function handleOb11Event(params: {
       },
     });
 
-    await core.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher({
-      ctx: ctxPayload,
-      cfg: config as OpenClawConfig,
-      dispatcherOptions: {
-        deliver: async (payload) => {
-          try {
-            const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+    const sendQueue = createSendQueue({ interSendDelayMs: 350 });
 
-            // Try native client first, then OB11
-            const nativeClient = getActiveNativeClient(account.accountId);
-            const replyTarget = validation.target;
-            if (nativeClient) {
-              // Native oicq client path
-              let messageId: string;
-              if (replyTarget.kind === "group") {
-                messageId = String(
-                  await nativeClient.sendGroupMsg(safeQqId(replyTarget.id, "groupId"), payload.text ?? ""),
-                );
-              } else {
-                messageId = String(
-                  await nativeClient.sendPrivateMsg(safeQqId(replyTarget.id, "userId"), payload.text ?? ""),
-                );
-              }
-              rememberSelfSentResponse({
-                accountId: account.accountId,
-                response: { status: "ok", data: { message_id: messageId } },
-                target: formatQqTarget(replyTarget),
-                text: payload.text ?? "",
+    const toolProgress = createToolProgressTracker({
+      statusCtx: {
+        account,
+        target: validation.target,
+        sendQueue,
+        statusSink,
+      },
+    });
+
+    const typingCallbacks = createDmTypingCallbacks({
+      isDm: !validation.isGroup,
+      statusCtx: {
+        account,
+        target: validation.target,
+        sendQueue,
+        statusSink,
+      },
+      responseState: toolProgress.getState(),
+      runtime,
+    });
+
+    await core.channel?.reply
+      ?.dispatchReplyWithBufferedBlockDispatcher({
+        ctx: ctxPayload,
+        cfg: config,
+        dispatcherOptions: {
+          typingCallbacks,
+          deliver: async (payload, info) => {
+            if (info.kind === "tool") {
+              // Track tool event for progress visibility
+              toolProgress.recordTool(payload.text);
+              // Schedule periodic status if no text has arrived yet
+              toolProgress.scheduleProgress();
+              return; // Skip delivering tool result text (Phase 1 behavior)
+            }
+
+            // Block or final: text has arrived, reset tool progress
+            toolProgress.resetProgress();
+
+            const rawText = payload.text ?? "";
+            const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+            if (!rawText && !mediaUrl) {return;}
+
+            // Format markdown for QQ readability:
+            // 1. Extract markdown images → CQ codes
+            // 2. Detect bare image URLs → CQ codes
+            // 3. Convert remaining markdown to QQ-readable text
+            const formattedText = convertMarkdownToQQ(
+              convertBareImageUrlsToCq(convertMarkdownImagesToCq(rawText)),
+            );
+
+            const targetKey = formatQqTarget(validation.target);
+            sendQueue.enqueue(targetKey, async () => {
+              await sendQqMessage({
+                account,
+                target: validation.target,
+                text: formattedText,
+                mediaUrl,
+                replyToId: payload.replyToId,
               });
               statusSink?.({ lastOutboundAt: Date.now() });
-              return;
-            }
-
-            // OB11 client path
-            const client = getActiveQqClient(account.accountId);
-            if (!client) {
-              throw new Error(`QQ client not running for account ${account.accountId}`);
-            }
-            const response = await sendOb11Message({
-              client,
-              target: replyTarget,
-              text: payload.text ?? "",
-              replyToId: payload.replyToId,
-              mediaUrl,
             });
-            rememberSelfSentResponse({
-              accountId: account.accountId,
-              response,
-              target: formatQqTarget(replyTarget),
-              text: payload.text ?? "",
-            });
-            statusSink?.({ lastOutboundAt: Date.now() });
-          } catch (err) {
-            throw err;
-          }
+          },
+          onError: (err, info) => {
+            runtime.error?.(`qq ${info.kind} reply failed: ${String(err)}`);
+          },
         },
-        onError: (err, info) => {
-          runtime.error?.(`qq ${info.kind} reply failed: ${String(err)}`);
-        },
-      },
-    }).catch((err) => {
-      runtime.error?.(`qq dispatch exception: ${String(err)}`);
-    });
+      })
+      .catch((err) => {
+        runtime.error?.(`qq dispatch exception: ${String(err)}`);
+      })
+      .finally(() => {
+        toolProgress.cleanup();
+      });
   } catch (err) {
     runtime.error?.(`qq handleOb11Event error: ${String(err)}`);
     throw err;
@@ -821,7 +850,9 @@ async function handleNoticeEvent(params: {
   }
 
   // Extract file info from the notice event
-  const file = event.file as { id?: string; name?: string; url?: string; size?: number } | undefined;
+  const file = event.file as
+    | { id?: string; name?: string; url?: string; size?: number }
+    | undefined;
   if (!file?.url && !file?.name) {
     runtime.log?.(`qq: notice ${noticeType} has no file info, skipping`);
     return;
@@ -918,13 +949,10 @@ async function handleNoticeEvent(params: {
       const nativeClient = getActiveNativeClient(account.accountId);
       if (nativeClient) {
         try {
-          const nativeResult = await nativeClient.getFile(fileId);
-          if (nativeResult) {
-            resolvedSource = String(nativeResult);
-            runtime.log?.(`qq: resolved file via native client: ${resolvedSource}`);
-          }
+          // Use OB11 get_file through the WS client instead (native oicq has no getFile API)
+          runtime.log?.(`qq: native client available but has no getFile; skipping native fallback`);
         } catch (err) {
-          runtime.log?.(`qq: native getFile failed for ${fileId}: ${String(err)}`);
+          runtime.log?.(`qq: native file fallback failed for ${fileId}: ${String(err)}`);
         }
       }
     }
@@ -955,16 +983,16 @@ async function handleNoticeEvent(params: {
   const sizeInfo = fileSize ? ` (${formatFileSize(fileSize)})` : "";
   const fileDescription = `[File received: ${fileName}${sizeInfo}]`;
   const filePathInfo = effectiveFilePath
-    ? (localFilePath && localFilePath !== resolvedSource
+    ? localFilePath && localFilePath !== resolvedSource
       ? `Local: ${localFilePath}\nSource: ${resolvedSource}`
-      : `URL: ${effectiveFilePath}`)
+      : `URL: ${effectiveFilePath}`
     : "(file could not be downloaded — no accessible URL or local path)";
   const fullBody = `${fileDescription}\n${filePathInfo}`;
 
   const mediaUrls = effectiveFilePath ? [effectiveFilePath] : [];
 
   const route = core.channel?.routing?.resolveAgentRoute({
-    cfg: config as OpenClawConfig,
+    cfg: config,
     channel: CHANNEL_ID,
     accountId: account.accountId,
     peer: {
@@ -978,23 +1006,27 @@ async function handleNoticeEvent(params: {
 
   const fromLabel = isGroup ? `group:${groupId}` : `user:${senderId}`;
 
-  const storePath = core.channel?.session?.resolveStorePath(config.session?.store, {
-    agentId: effectiveAgentId,
-  }) ?? "";
-  const envelopeOptions = core.channel?.reply?.resolveEnvelopeFormatOptions(config as OpenClawConfig) ?? {};
-  const previousTimestamp = core.channel?.session?.readSessionUpdatedAt({
-    storePath,
-    sessionKey: route.sessionKey,
-  }) ?? Date.now();
+  const storePath =
+    core.channel?.session?.resolveStorePath(config.session?.store, {
+      agentId: effectiveAgentId,
+    }) ?? "";
+  const envelopeOptions =
+    core.channel?.reply?.resolveEnvelopeFormatOptions(config) ?? {};
+  const previousTimestamp =
+    core.channel?.session?.readSessionUpdatedAt({
+      storePath,
+      sessionKey: route.sessionKey,
+    }) ?? Date.now();
 
-  const body = core.channel?.reply?.formatAgentEnvelope({
-    channel: "QQ",
-    from: fromLabel,
-    timestamp,
-    previousTimestamp,
-    envelope: envelopeOptions,
-    body: fullBody,
-  }) ?? fullBody;
+  const body =
+    core.channel?.reply?.formatAgentEnvelope({
+      channel: "QQ",
+      from: fromLabel,
+      timestamp,
+      previousTimestamp,
+      envelope: envelopeOptions,
+      body: fullBody,
+    }) ?? fullBody;
 
   const ctxPayload = core.channel?.reply?.finalizeInboundContext({
     Body: body,
@@ -1034,71 +1066,81 @@ async function handleNoticeEvent(params: {
     },
   });
 
-  await core.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: config as OpenClawConfig,
-    dispatcherOptions: {
-      deliver: async (payload) => {
-        try {
-          const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+  const noticeSendQueue = createSendQueue({ interSendDelayMs: 350 });
 
-          // Try native client first, then OB11
-          const nativeClient = getActiveNativeClient(account.accountId);
-          if (nativeClient) {
-            let messageId: string;
-            if (target.kind === "group") {
-              messageId = String(
-                await nativeClient.sendGroupMsg(safeQqId(target.id, "groupId"), payload.text ?? ""),
-              );
-            } else {
-              messageId = String(
-                await nativeClient.sendPrivateMsg(safeQqId(target.id, "userId"), payload.text ?? ""),
-              );
-            }
-            rememberSelfSentResponse({
-              accountId: account.accountId,
-              response: { status: "ok", data: { message_id: messageId } },
-              target: formatQqTarget(target),
-              text: payload.text ?? "",
-            });
-            statusSink?.({ lastOutboundAt: Date.now() });
+  const noticeToolProgress = createToolProgressTracker({
+    statusCtx: {
+      account,
+      target,
+      sendQueue: noticeSendQueue,
+      statusSink,
+    },
+  });
+
+  const noticeTypingCallbacks = createDmTypingCallbacks({
+    isDm: !isGroup,
+    statusCtx: {
+      account,
+      target,
+      sendQueue: noticeSendQueue,
+      statusSink,
+    },
+    responseState: noticeToolProgress.getState(),
+    runtime,
+  });
+
+  await core.channel?.reply
+    ?.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: config,
+      dispatcherOptions: {
+        typingCallbacks: noticeTypingCallbacks,
+        deliver: async (payload, info) => {
+          if (info.kind === "tool") {
+            noticeToolProgress.recordTool(payload.text);
+            noticeToolProgress.scheduleProgress();
             return;
           }
 
-          // OB11 client path
-          const client = getActiveQqClient(account.accountId);
-          if (!client) {
-            throw new Error(`QQ client not running for account ${account.accountId}`);
-          }
-          const response = await sendOb11Message({
-            client,
-            target,
-            text: payload.text ?? "",
-            mediaUrl,
+          noticeToolProgress.resetProgress();
+
+          const rawText = payload.text ?? "";
+          const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
+          if (!rawText && !mediaUrl) {return;}
+
+          // Format markdown for QQ readability
+          const formattedText = convertMarkdownToQQ(
+            convertBareImageUrlsToCq(convertMarkdownImagesToCq(rawText)),
+          );
+
+          const targetKey = formatQqTarget(target);
+          noticeSendQueue.enqueue(targetKey, async () => {
+            await sendQqMessage({
+              account,
+              target,
+              text: formattedText,
+              mediaUrl,
+              replyToId: payload.replyToId,
+            });
+            statusSink?.({ lastOutboundAt: Date.now() });
           });
-          rememberSelfSentResponse({
-            accountId: account.accountId,
-            response,
-            target: formatQqTarget(target),
-            text: payload.text ?? "",
-          });
-          statusSink?.({ lastOutboundAt: Date.now() });
-        } catch (err) {
-          throw err;
-        }
+        },
+        onError: (err, info) => {
+          runtime.error?.(`qq file notice ${info.kind} reply failed: ${String(err)}`);
+        },
       },
-      onError: (err, info) => {
-        runtime.error?.(`qq file notice ${info.kind} reply failed: ${String(err)}`);
-      },
-    },
-  }).catch((err) => {
-    runtime.error?.(`qq file notice dispatch exception: ${String(err)}`);
-  });
+    })
+    .catch((err) => {
+      runtime.error?.(`qq file notice dispatch exception: ${String(err)}`);
+    })
+    .finally(() => {
+      noticeToolProgress.cleanup();
+    });
 }
 
 function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  if (bytes < 1024) {return `${bytes}B`;}
+  if (bytes < 1024 * 1024) {return `${(bytes / 1024).toFixed(1)}KB`;}
+  if (bytes < 1024 * 1024 * 1024) {return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;}
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
 }

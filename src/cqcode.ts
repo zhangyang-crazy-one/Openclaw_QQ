@@ -4,7 +4,9 @@ export type CqSegment = {
 };
 
 function toSegmentString(value?: string | number): string {
-  if (value == null) return "";
+  if (value == null) {
+    return "";
+  }
   return String(value);
 }
 
@@ -30,7 +32,9 @@ export function parseCqSegments(message: string): CqSegment[] {
     if (trimmed) {
       for (const entry of trimmed.split(",")) {
         const [key, value = ""] = entry.split("=");
-        if (!key) continue;
+        if (!key) {
+          continue;
+        }
         data[key] = value;
       }
     }
@@ -61,7 +65,9 @@ export function renderCqSegments(segments: CqSegment[]): {
   for (const segment of segments) {
     if (segment.type === "text") {
       const text = toSegmentString(segment.data.text);
-      if (text) parts.push(text);
+      if (text) {
+        parts.push(text);
+      }
       continue;
     }
     if (segment.type === "at") {
@@ -74,7 +80,9 @@ export function renderCqSegments(segments: CqSegment[]): {
     }
     if (segment.type === "reply") {
       const id = toSegmentString(segment.data.id);
-      if (id) replyToId = id;
+      if (id) {
+        replyToId = id;
+      }
       continue;
     }
     if (segment.type === "image" || segment.type === "record" || segment.type === "video") {
@@ -103,12 +111,10 @@ export function renderCqSegments(segments: CqSegment[]): {
       continue;
     }
     if (segment.type === "json") {
-      const data = toSegmentString(segment.data.data);
       parts.push(`[JSON Card]`);
       continue;
     }
     if (segment.type === "xml") {
-      const data = toSegmentString(segment.data.data);
       parts.push(`[XML Card]`);
       continue;
     }
@@ -119,6 +125,46 @@ export function renderCqSegments(segments: CqSegment[]): {
     mentions,
     replyToId,
   };
+}
+
+/**
+ * Convert markdown image syntax `![alt](url)` to CQ image codes.
+ *
+ * Example: `![diagram](https://example.com/img.png)` →
+ * `[CQ:image,file=https://example.com/img.png]`
+ */
+export function convertMarkdownImagesToCq(text: string): string {
+  if (!text) {
+    return text;
+  }
+  return text.replace(/!\[[^\]]*\]\(([^)]+)\)/g, (_match, url) => {
+    return `[CQ:image,file=${url}]`;
+  });
+}
+
+/**
+ * Detect bare image URLs (standalone URLs ending in image extensions)
+ * and convert them to CQ image codes.
+ *
+ * A URL is considered "bare" when it appears on its own line or as a
+ * standalone segment. This avoids wrapping URLs inside code blocks or
+ * other inline contexts.
+ */
+export function convertBareImageUrlsToCq(text: string): string {
+  if (!text) {
+    return text;
+  }
+  // Match URLs that are on their own line or at word boundaries and end
+  // with a recognized image extension
+  return text
+    .replace(
+      /(?:^|\s)(https?:\/\/\S+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?\S*)?(?:#\S*)?)(?:\s|$)/gim,
+      (_match, url) => {
+        // Preserve surrounding whitespace
+        return ` [CQ:image,file=${url}] `;
+      },
+    )
+    .trim();
 }
 
 export function buildCqMessage(params: {
