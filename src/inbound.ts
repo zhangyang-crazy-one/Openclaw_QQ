@@ -775,13 +775,10 @@ export async function handleOb11Event(params: {
           typingCallbacks,
           deliver: async (payload, info) => {
             if (info.kind === "tool") {
-              // Track tool event for progress visibility
               toolProgress.recordTool(payload.text);
-              // Schedule periodic status if no text has arrived yet
               toolProgress.scheduleProgress();
-              return; // Skip delivering tool result text (Phase 1 behavior)
+              return;
             }
-
             // Block or final: text has arrived, reset tool progress
             toolProgress.resetProgress();
 

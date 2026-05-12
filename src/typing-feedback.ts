@@ -35,17 +35,26 @@ export async function sendStatus(ctx: StatusContext, text: string): Promise<void
 }
 
 /** Extract a tool name from payload text produced by the agent model.
- *  Handles two common formats:
+ *  Handles multiple known formats across models:
  *  1. Emoji-prefixed: "🔍 web_search: query" → "web_search"
- *  2. Bracket-prefixed: "[Tool: read_file] ..." → "read_file" */
+ *  2. Bracket-prefixed: "[Tool: read_file] ..." → "read_file"
+ *  3. Emoji-isolated: "🔍 read_file" → "read_file"
+ *  4. Tool result prefix: "Tool web_search returned:" → "web_search"
+ *  5. Bold tool name: "**web_search**" → "web_search" */
 export function extractToolNameFromText(text?: string): string | null {
   if (!text) return null;
-  // Emoji + tool name pattern (non-colon, non-whitespace word)
-  const emojiMatch = text.match(/^[\p{Emoji}]\s*([^:\s]+)/u);
+  // Format 1: Emoji + tool name (with optional colon)
+  const emojiMatch = text.match(/^[\p{Emoji_Presentation}\p{Emoji}\u{2696}\u{1F3F9}]\s*([a-zA-Z_][a-zA-Z0-9_-]*)/u);
   if (emojiMatch) return emojiMatch[1];
-  // Bracket fallback (capture word characters including _ and -)
+  // Format 2: Bracket
   const bracketMatch = text.match(/^\[Tool:\s*([^\]\s]+)/);
   if (bracketMatch) return bracketMatch[1];
+  // Format 4: Tool return text
+  const returnMatch = text.match(/^Tool\s+([a-zA-Z_][a-zA-Z0-9_-]*)\s+returned/i);
+  if (returnMatch) return returnMatch[1];
+  // Format 5: Bold
+  const boldMatch = text.match(/^\*\*([a-zA-Z_][a-zA-Z0-9_-]*)\*\*/);
+  if (boldMatch) return boldMatch[1];
   return null;
 }
 
@@ -59,17 +68,35 @@ export function createDmTypingCallbacks(params: {
 }): ReturnType<typeof createTypingCallbacks> | undefined {
   if (!params.isDm) return undefined;
 
+  let startSent = false;
+  let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  let elapsedSeconds = 0;
+
   return createTypingCallbacks({
     start: async () => {
-      await sendStatus(params.statusCtx, "处理中...");
+      if (startSent) return;
+      startSent = true;
+      await sendStatus(params.statusCtx, "⏳ 处理中...");
+      // Fallback periodic status — tool events don't reach our deliver callback,
+      // so we show elapsed time to maintain user connection.
+      elapsedTimer = setInterval(async () => {
+        elapsedSeconds += 5;
+        if (params.responseState.hasTextResponse) {
+          if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+          return;
+        }
+        if (params.responseState.toolCount > 0) {
+          return; // tool progress tracker handles this case
+        }
+        await sendStatus(params.statusCtx, `⏳ 处理中... ${elapsedSeconds}s`);
+      }, 5000);
     },
     stop: async () => {
-      // Send completion indicator only for tool-only responses
-      // (when no block/final text was ever delivered to the user).
-      // When the agent sends text, the text itself signals "done."
-      if (!params.responseState.hasTextResponse) {
-        await sendStatus(params.statusCtx, "已完成");
-      }
+      if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+      if (params.responseState.hasTextResponse) return;
+      const count = params.responseState.toolCount;
+      const msg = count > 0 ? `✅ 完成 (${count} tools)` : "✅ 完成";
+      await sendStatus(params.statusCtx, msg);
     },
     onStartError: (err) => {
       params.runtime.error?.(`qq typing start failed: ${String(err)}`);
@@ -90,8 +117,10 @@ export interface ToolProgressState {
   hasTextResponse: boolean;
   /** The most recently seen tool name, or null if none parsed. */
   currentToolName: string | null;
-  /** Timestamp when the current tool started (ms since epoch). */
+  /** Timestamp when the first tool started (ms since epoch). */
   toolStartTime: number | null;
+  /** Number of tool deliveries recorded. */
+  toolCount: number;
 }
 
 export interface ToolProgressTracker {
@@ -118,7 +147,10 @@ export function createToolProgressTracker(params: {
     hasTextResponse: false,
     currentToolName: null,
     toolStartTime: null,
+    toolCount: 0,
   };
+
+  let lastSentText = "";
 
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -130,11 +162,23 @@ export function createToolProgressTracker(params: {
   };
 
   const recordTool = (toolText?: string): void => {
-    // Reset timer on every tool event to prevent stale progress messages
-    // when tools execute in rapid succession (per RESEARCH.md Pitfall 3).
     clearTimer();
-    state.toolStartTime = Date.now();
-    state.currentToolName = extractToolNameFromText(toolText) ?? state.currentToolName;
+    const parsed = extractToolNameFromText(toolText);
+    if (parsed) state.currentToolName = parsed;
+    if (!state.toolStartTime) state.toolStartTime = Date.now();
+    state.toolCount++;
+  };
+
+  const buildProgressText = (): string => {
+    const elapsed = state.toolStartTime
+      ? Math.round((Date.now() - state.toolStartTime) / 1000)
+      : 0;
+    if (state.currentToolName && state.toolCount > 0) {
+      const extra = state.toolCount > 1 ? ` +${state.toolCount - 1} tools` : "";
+      return `🔧 ${state.currentToolName}${extra} (${elapsed}s)`;
+    }
+    if (state.toolCount > 0) return `🔧 执行工具... (${elapsed}s)`;
+    return `⏳ 处理中...`;
   };
 
   const scheduleProgress = (): void => {
@@ -142,18 +186,11 @@ export function createToolProgressTracker(params: {
 
     timer = setTimeout(async () => {
       if (state.hasTextResponse) return;
-
-      const elapsed = state.toolStartTime
-        ? Math.round((Date.now() - state.toolStartTime) / 1000)
-        : 0;
-      const label = state.currentToolName
-        ? `运行: ${state.currentToolName} (${elapsed}s)`
-        : `工作中... (${elapsed}s)`;
-
+      const label = buildProgressText();
+      if (label === lastSentText) { timer = null; scheduleProgress(); return; }
+      lastSentText = label;
       await sendStatus(statusCtx, label);
       timer = null;
-
-      // Re-schedule if still waiting (for very long tool executions)
       scheduleProgress();
     }, intervalMs);
   };

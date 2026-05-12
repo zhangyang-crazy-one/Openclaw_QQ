@@ -69,14 +69,14 @@ describe("sendStatus", () => {
     };
     const ctx = makeStatusContext({ sendQueue });
 
-    await sendStatus(ctx, "处理中...");
+    await sendStatus(ctx, "⏳ 处理中...");
 
     // Verify enqueue was called with the target key
     expect(sendQueue.enqueue).toHaveBeenCalledTimes(1);
     // Verify sendQqMessage was called with "[Agent] " prefix
     expect(mockSendQqMessage).toHaveBeenCalledTimes(1);
     expect(mockSendQqMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: "[Agent] 处理中..." }),
+      expect.objectContaining({ text: "[Agent] ⏳ 处理中..." }),
     );
   });
 
@@ -209,7 +209,7 @@ describe("createDmTypingCallbacks", () => {
     await callbacks!.onReplyStart();
 
     expect(mockSendQqMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: "[Agent] 处理中..." }),
+      expect.objectContaining({ text: "[Agent] ⏳ 处理中..." }),
     );
   });
 
@@ -226,7 +226,7 @@ describe("createDmTypingCallbacks", () => {
     await vi.runAllTimersAsync();
 
     expect(mockSendQqMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: "[Agent] 已完成" }),
+      expect.objectContaining({ text: "[Agent] ✅ 完成" }),
     );
     vi.useRealTimers();
   });
@@ -298,7 +298,7 @@ describe("createToolProgressTracker", () => {
 
     expect(mockSendQqMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("运行: read"),
+        text: expect.stringContaining("🔧 read"),
       }),
     );
     vi.useRealTimers();
