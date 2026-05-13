@@ -6,7 +6,8 @@ import { logInboundDrop, resolveControlCommandGate } from "openclaw/plugin-sdk/i
 import { mergeAllowlist, resolveMentionGatingWithBypass } from "openclaw/plugin-sdk/zalouser";
 import { getActiveQqClient } from "./adapter.js";
 import { resolveGroupConfig } from "./config.js";
-import { convertBareImageUrlsToCq, convertMarkdownImagesToCq, parseCqSegments } from "./cqcode.js";
+import { parseCqSegments } from "./cqcode.js";
+import { convertMarkdownToQQ } from "./markdown-formatter.js";
 import { createSendQueue } from "./message-queue.js";
 import { parseOb11Message, hasSelfMention } from "./message-utils.js";
 import { sendQqMessage } from "./native-ob11-bridge.js";
@@ -787,17 +788,16 @@ export async function handleOb11Event(params: {
 
             // Extract images to CQ codes, then send remaining content as markdown
             // (LLBot converts OB11 markdown segments to QQ native Markdown element type 14)
-            const imageStripped = convertBareImageUrlsToCq(convertMarkdownImagesToCq(rawText));
+            const formattedText = convertMarkdownToQQ(rawText);
 
             const targetKey = formatQqTarget(validation.target);
             sendQueue.enqueue(targetKey, async () => {
               await sendQqMessage({
                 account,
                 target: validation.target,
-                text: imageStripped,
+                text: formattedText,
                 mediaUrl,
                 replyToId: payload.replyToId,
-                asMarkdown: true,
               });
               statusSink?.({ lastOutboundAt: Date.now() });
             });
@@ -1101,17 +1101,16 @@ async function handleNoticeEvent(params: {
           const mediaUrl = payload.mediaUrl ?? payload.mediaUrls?.[0];
           if (!rawText && !mediaUrl) {return;}
 
-          const imageStripped = convertBareImageUrlsToCq(convertMarkdownImagesToCq(rawText));
+          const formattedText = convertMarkdownToQQ(rawText);
 
           const targetKey = formatQqTarget(target);
           noticeSendQueue.enqueue(targetKey, async () => {
             await sendQqMessage({
               account,
               target,
-              text: imageStripped,
+              text: formattedText,
               mediaUrl,
               replyToId: payload.replyToId,
-              asMarkdown: true,
             });
             statusSink?.({ lastOutboundAt: Date.now() });
           });

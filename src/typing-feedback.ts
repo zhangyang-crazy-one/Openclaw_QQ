@@ -80,16 +80,16 @@ export function createDmTypingCallbacks(params: {
       // Fallback periodic status — tool events don't reach our deliver callback,
       // so we show elapsed time to maintain user connection.
       elapsedTimer = setInterval(async () => {
-        elapsedSeconds += 5;
+        elapsedSeconds += 20;
         if (params.responseState.hasTextResponse) {
           if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
           return;
         }
         if (params.responseState.toolCount > 0) {
-          return; // tool progress tracker handles this case
+          return;
         }
         await sendStatus(params.statusCtx, `⏳ 处理中... ${elapsedSeconds}s`);
-      }, 5000);
+      }, 20000);
     },
     stop: async () => {
       if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }

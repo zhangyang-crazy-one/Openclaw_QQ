@@ -2,39 +2,31 @@
  * Markdown-to-QQ text formatter.
  *
  * QQ (via OneBot) does not render markdown natively. This module converts
- * common markdown constructs into QQ-compatible plain-text representations
- * so agent responses are readable for QQ users.
- *
- * All functions are pure — they take a string and return a string.
+ * common markdown constructs into visually structured plain-text using
+ * Unicode box-drawing and typographic characters for readability.
  */
+import { convertBareImageUrlsToCq, convertMarkdownImagesToCq } from "./cqcode.js";
+
+// ── Fenced code block isolation ──────────────────────────────────────────
 
 let fencedBlockRegistry: string[] = [];
-const fencedPlaceholder = (i: number) => `__FENCED_BLOCK_${i}__`;
+const fencedPlaceholder = (i: number) => `\x00FENCED_${i}\x00`;
 
-/**
- * Extract fenced code blocks and replace them with placeholders.
- * Returns text with placeholders inserted. The caller must call
- * restoreFencedBlocks() after all other markdown processing.
- */
 export function extractFencedBlocks(text: string): string {
   fencedBlockRegistry = [];
-  // Match ```optionalLang\ncontent\n``` — content is non-greedy per block
   const fencedRegex = /```(\w*)\n([\s\S]*?)```/g;
-
   return text.replace(fencedRegex, (_match, lang, code) => {
     const idx = fencedBlockRegistry.length;
-    const langLabel = lang ? `Code: ${lang}` : "Code";
-    // Remove trailing newline if present before the closing backticks
     const cleanCode = code.endsWith("\n") ? code.slice(0, -1) : code;
-    fencedBlockRegistry.push(`[${langLabel}]\n${cleanCode}\n[/Code]`);
+    const langLabel = lang || "code";
+    const top = `┌── ${langLabel} ──`;
+    const bottom = `└──`;
+    const indented = cleanCode.split("\n").map((l: string) => `│ ${l}`).join("\n");
+    fencedBlockRegistry.push(`${top}\n${indented}\n${bottom}`);
     return fencedPlaceholder(idx);
   });
 }
 
-/**
- * Restore fenced code blocks from their placeholders.
- * Must be called LAST, after all other markdown processing.
- */
 export function restoreFencedBlocks(text: string): string {
   let result = text;
   for (let i = 0; i < fencedBlockRegistry.length; i++) {
@@ -43,187 +35,213 @@ export function restoreFencedBlocks(text: string): string {
   return result;
 }
 
-/**
- * Convert fenced code blocks (```lang\ncode\n```) to QQ-readable form.
- * Public convenience function for standalone use (extract + restore in one call).
- * NOTE: For use within convertMarkdownToQQ, prefer the two-phase approach
- * (extractFencedBlocks + restoreFencedBlocks) to properly isolate code content.
- */
-export function convertFencedCodeBlocks(text: string): string {
-  const extracted = extractFencedBlocks(text);
-  return restoreFencedBlocks(extracted);
-}
+// ── Individual converters ────────────────────────────────────────────────
 
-/**
- * Convert inline code spans (`code`) to QQ-readable form.
- * Must be called AFTER fenced code blocks are converted (so backticks
- * inside fenced blocks aren't misinterpreted).
- */
 export function convertInlineCode(text: string): string {
-  return text.replace(/`([^`]+)`/g, (_match, code) => `<${code}>`);
+  return text.replace(/`([^`]+)`/g, (_m: string, code: string) => `『${code}』`);
 }
 
-/**
- * Convert bold markdown (**text**) to QQ-compatible emphasis.
- */
 export function convertBold(text: string): string {
-  return text.replace(/\*\*([^*]+)\*\*/g, (_match, content) => `【${content}】`);
+  return text.replace(/\*\*([^*]+)\*\*/g, (_m: string, content: string) => `【${content}】`);
 }
 
-/**
- * Convert italic markdown (*text* or _text_) — keep as-is since QQ
- * displays asterisks and underscores natively. This is a no-op but
- * kept for explicit documentation of the design decision.
- */
 export function convertItalic(text: string): string {
-  // QQ displays *text* and _text_ natively — no conversion needed
+  // Preserve *text* — QQ displays it natively and it's a common plaintext convention
   return text;
 }
 
-/**
- * Convert markdown links [text](url) to text (url) format.
- */
 export function convertLinks(text: string): string {
-  return text.replace(
-    /\[([^\]]+)\]\(([^)]+)\)/g,
-    (_match, linkText, url) => `${linkText} (${url})`,
-  );
+  return text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m: string, t: string, u: string) => `${t} (${u})`);
 }
 
-/**
- * Convert markdown images ![alt](url) to a plain text reference.
- * (Primary image→CQ conversion is handled by cqcode.ts before formatting.)
- */
 export function convertImages(text: string): string {
-  return text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, url) => {
-    if (alt) {
-      return `[Image: ${alt}] (${url})`;
-    }
-    return `[Image: ${url}]`;
+  return text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m: string, alt: string, url: string) => {
+    return alt ? `[img: ${alt}]` : `[img]`;
   });
 }
 
-/**
- * Convert ATX headings (# Heading, ## Heading, etc.) to QQ-compatible form.
- */
+/** Strip or convert basic HTML tags that may appear in markdown. */
+export function convertHtmlTags(text: string): string {
+  // Line breaks
+  let result = text.replace(/<br\s*\/?>/gi, "\n");
+  // Bold/strong → preserve content
+  result = result.replace(/<\/?(?:b|strong)>/gi, "**");
+  // Italic/em → preserve content
+  result = result.replace(/<\/?(?:i|em)>/gi, "*");
+  // Strikethrough
+  result = result.replace(/<\/?(?:s|del|strike)>/gi, "~~");
+  // Code
+  result = result.replace(/<\/?(?:code|tt)>/gi, "`");
+  // Paragraphs
+  result = result.replace(/<\/?p>/gi, "\n");
+  // Divs → newline
+  result = result.replace(/<\/?div[^>]*>/gi, "\n");
+  // Lists
+  result = result.replace(/<\/?(?:ul|ol|li)>/gi, "");
+  // Links (<a href="...">text</a>)
+  result = result.replace(/<a\s+[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/gi, (_m, u, t) => `${t} (${u})`);
+  // Images (<img src="..." alt="...">)
+  result = result.replace(/<img\s+[^>]*src="([^"]*)"[^>]*alt="([^"]*)?"[^>]*\/?>/gi, (_m, u, a) => a ? `[img: ${a}]` : `[img]`);
+  // Strip remaining unknown tags
+  result = result.replace(/<[^>]+>/g, "");
+  return result;
+}
+
+/** Convert ordered lists: preserve numbering, normalize format. */
+export function normalizeOrderedLists(text: string): string {
+  return text.replace(/^(\s*)\d+\.\s+/gm, "$11. ");
+}
+
+/** Convert task lists: - [ ] → ☐, - [x] → ☑ */
+export function convertTaskLists(text: string): string {
+  let result = text.replace(/^(\s*)[-*+]\s+\[ \]\s*/gm, "$1☐ ");
+  result = result.replace(/^(\s*)[-*+]\s+\[x\]\s*/gim, "$1☑ ");
+  return result;
+}
+
+/** Convert setext-style headings (underline with === or ---) */
+export function convertSetextHeadings(text: string): string {
+  let lines = text.split("\n");
+  for (let i = 1; i < lines.length; i++) {
+    const prev = lines[i - 1] ?? "";
+    const curr = lines[i] ?? "";
+    if (/^=+\s*$/.test(curr)) {
+      lines[i - 1] = `【${prev}】`;
+      lines[i] = "";
+    } else if (/^-+\s*$/.test(curr) && !prev.startsWith("|")) {
+      lines[i - 1] = `【${prev}】`;
+      lines[i] = "";
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Convert email-style quotes (> > >) to nested indicators. */
+export function normalizeNestedBlockquotes(text: string): string {
+  return text.replace(/^(>+)\s?(.*)$/gm, (_m: string, markers: string, content: string) => {
+    const depth = markers.length;
+    const prefix = "▎".repeat(Math.min(depth, 3));
+    return `${prefix}${content}`;
+  });
+}
+
 export function convertHeadings(text: string): string {
-  return text.replace(/^#{1,6}\s+(.+)$/gm, (_match, content) => `【${content}】`);
+  return text.replace(/^#{1,6}\s+(.+)$/gm, (_m: string, content: string) => `\n【${content}】`);
 }
 
-/**
- * Convert strikethrough (~~text~~) to QQ-readable form.
- */
 export function convertStrikethrough(text: string): string {
-  return text.replace(/~~([^~]+)~~/g, (_match, content) => `~${content}~`);
+  return text.replace(/~~([^~]+)~~/g, (_m: string, content: string) => `~${content}~`);
 }
 
-/**
- * Convert blockquotes (> quote) — indent with spaces.
- */
 export function convertBlockquotes(text: string): string {
-  return text.replace(/^>\s?(.*)$/gm, (_match, content) => `  ${content}`);
+  return text.replace(/^>\s?(.*)$/gm, (_m: string, content: string) => `▎${content}`);
 }
 
-/**
- * Convert horizontal rules (---, ***, ___) to a dash.
- */
 export function convertHorizontalRules(text: string): string {
-  return text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, "—"); // em dash
+  return text.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, "─".repeat(20));
 }
 
-/**
- * Normalize list markers — QQ renders `- item` and `1. item` natively,
- * but normalize inconsistent prefixes (e.g., `* item` → `- item`).
- */
 export function normalizeLists(text: string): string {
-  return text.replace(/^(\s*)[*+]\s/gm, "$1- ");
+  return text.replace(/^(\s*)[*+]\s/gm, "$1• ");
 }
 
-/**
- * Collapse excessive blank lines (3+ consecutive newlines → 2).
- */
+export function convertFencedCodeBlocks(text: string): string {
+  return restoreFencedBlocks(extractFencedBlocks(text));
+}
+
 export function collapseBlankLines(text: string): string {
   return text.replace(/\n{3,}/g, "\n\n");
 }
 
 /**
- * Convert all supported markdown to QQ-readable text.
- *
- * Transformation order matters:
- * 1. Fenced code blocks first (they contain raw text that must be isolated)
- * 2. Inline code (after fenced blocks, so backticks inside blocks are safe)
- * 3. Images (after links, so [text](url) doesn't match image syntax)
- *    Note: Links convert before images since image markdown starts with !
- * 4. Links
- * 5. Bold
- * 6. Italic
- * 7. Headings
- * 8. Strikethrough
- * 9. Blockquotes
- * 10. Horizontal rules
- * 11. List normalization
- * 12. Whitespace cleanup
- *
- * @param text - Raw markdown text from the agent
- * @returns QQ-compatible formatted text
+ * Convert markdown tables to aligned plaintext.
+ * Example:
+ * | col1 | col2 |
+ * |------|------|
+ * | a    | b    |
+ * →
+ * ┌──────┬──────┐
+ * │ col1 │ col2 │
+ * ├──────┼──────┤
+ * │ a    │ b    │
+ * └──────┴──────┘
  */
-export function convertMarkdownToQQ(text: string): string {
-  if (!text) {
-    return "";
+export function convertTables(text: string): string {
+  try {
+    const tableRegex = /^\|(.+)\|\n\|[-| :]+\|\n((?:\|.+\|\n?)+)/gm;
+    return text.replace(tableRegex, (_match: string, headerRow: string, _sep: string, bodyRows: string) => {
+      if (!bodyRows || typeof bodyRows !== "string") return _match;
+      const parseRow = (r: string) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const headers = parseRow(headerRow);
+      const rows = bodyRows.trim().split("\n").map(parseRow);
+      const colCount = headers.length;
+
+      // Convert to bullet list — most readable in QQ, survives auto-wrap
+      const result: string[] = [];
+      for (const row of rows) {
+        const vals: string[] = [];
+        for (let ci = 0; ci < colCount; ci++) {
+          const key = headers[ci] ?? "";
+          const val = (row[ci] ?? "").trim();
+          if (key && val) vals.push(`${key}: ${val}`);
+          else if (val) vals.push(val);
+        }
+        result.push(`• ${vals.join(", ")}`);
+      }
+      return result.join("\n");
+    });
+  } catch {
+    return text;
   }
-
-  let result = text;
-
-  // Phase 1: Extract fenced code blocks into placeholders (do NOT restore yet)
-  result = extractFencedBlocks(result);
-
-  // Phase 2: Process remaining inline constructs on placeholder-containing text
-  result = convertInlineCode(result);
-  result = convertLinks(result);
-  result = convertImages(result);
-  result = convertBold(result);
-  result = convertItalic(result);
-  result = convertHeadings(result);
-  result = convertStrikethrough(result);
-  result = convertBlockquotes(result);
-  result = convertHorizontalRules(result);
-
-  // Phase 3: Normalize and cleanup (before restoring code blocks)
-  result = normalizeLists(result);
-  result = collapseBlankLines(result);
-
-  // Phase 4: Restore fenced code blocks (LAST — so code content is untouched)
-  result = restoreFencedBlocks(result);
-
-  // Trim trailing whitespace only (preserve leading blockquote indentation)
-  result = result.replace(/\s+$/, "");
-
-  return result;
 }
 
-/**
- * Split text at paragraph boundaries (double newline), respecting a
- * character limit as an upper bound for each chunk.
- *
- * Strategy:
- * - Split at \n\n boundaries first
- * - When a single paragraph exceeds the limit, fall back to sentence-level
- *   splitting at common punctuation boundaries
- * - Ensure no chunk exceeds the limit
- *
- * @param text - The text to split
- * @param limit - Maximum character count per chunk
- * @returns Array of text chunks, each within the limit
- */
-export function splitAtParagraphs(text: string, limit: number): string[] {
-  if (!text) {
-    return [];
-  }
-  if (text.length <= limit) {
-    return [text];
-  }
+// ── Main pipeline ────────────────────────────────────────────────────────
 
-  // Split at paragraph boundaries
+export function convertMarkdownToQQ(text: string): string {
+  if (!text) return "";
+  try {
+    // Pre-process: extract images to CQ codes first
+    let result = convertBareImageUrlsToCq(convertMarkdownImagesToCq(text));
+
+    // Phase 1: Isolate fenced code blocks
+    result = extractFencedBlocks(result);
+
+    // Phase 2: Process inline constructs
+    result = convertHtmlTags(result);
+    result = convertTables(result);
+    result = convertSetextHeadings(result);
+    result = convertInlineCode(result);
+    result = convertLinks(result);
+    result = convertImages(result);
+    result = convertBold(result);
+    result = convertItalic(result);
+    result = convertHeadings(result);
+    result = convertStrikethrough(result);
+    result = normalizeNestedBlockquotes(result);
+    result = convertBlockquotes(result);
+    result = convertHorizontalRules(result);
+
+    // Phase 3: Normalize
+    result = convertTaskLists(result);
+    result = normalizeOrderedLists(result);
+    result = normalizeLists(result);
+    result = collapseBlankLines(result);
+
+    // Phase 4: Restore fenced code blocks (LAST)
+    result = restoreFencedBlocks(result);
+
+    return result.replace(/\s+$/, "");
+  } catch {
+    return text; // never crash the pipeline
+  }
+}
+
+// ── Paragraph splitting ──────────────────────────────────────────────────
+
+export function splitAtParagraphs(text: string, limit: number): string[] {
+  if (!text) return [];
+  if (text.length <= limit) return [text];
+
   const paragraphs = text.split(/\n\n+/);
   const chunks: string[] = [];
 
@@ -232,67 +250,36 @@ export function splitAtParagraphs(text: string, limit: number): string[] {
       chunks.push(paragraph);
       continue;
     }
-
-    // Paragraph exceeds limit — try sentence splitting
     const sentenceDelimiter = /(?<=[。！？.!?\n])\s*/g;
     let current = "";
-
     const sentences = paragraph.split(sentenceDelimiter).filter((s) => s.trim());
     for (const sentence of sentences) {
       const candidate = current ? `${current} ${sentence.trim()}` : sentence.trim();
-      if (candidate.length <= limit) {
-        current = candidate;
-        continue;
-      }
-
-      // Push accumulated text
-      if (current) {
-        chunks.push(current);
-      }
-
-      // If a single sentence exceeds the limit, hard-chop it
+      if (candidate.length <= limit) { current = candidate; continue; }
+      if (current) chunks.push(current);
       if (sentence.trim().length > limit) {
         const trimmed = sentence.trim();
-        for (let i = 0; i < trimmed.length; i += limit) {
-          chunks.push(trimmed.slice(i, i + limit));
-        }
+        for (let i = 0; i < trimmed.length; i += limit) chunks.push(trimmed.slice(i, i + limit));
         current = "";
       } else {
         current = sentence.trim();
       }
     }
-
-    if (current) {
-      chunks.push(current);
-    }
+    if (current) chunks.push(current);
   }
-
-  // Merge adjacent small chunks to avoid too many tiny messages
   return mergeSmallChunks(chunks, limit);
 }
 
-/**
- * Merge adjacent chunks that can fit together within the limit.
- */
 function mergeSmallChunks(chunks: string[], limit: number): string[] {
-  if (chunks.length <= 1) {
-    return chunks;
-  }
-
+  if (chunks.length <= 1) return chunks;
   const merged: string[] = [];
   let current = chunks[0] ?? "";
-
   for (let i = 1; i < chunks.length; i++) {
     const next = chunks[i] ?? "";
     const candidate = `${current}\n\n${next}`;
-    if (candidate.length <= limit) {
-      current = candidate;
-    } else {
-      merged.push(current);
-      current = next;
-    }
+    if (candidate.length <= limit) { current = candidate; }
+    else { merged.push(current); current = next; }
   }
-
   merged.push(current);
   return merged;
 }

@@ -1,5 +1,5 @@
-import { DmPolicySchema, GroupPolicySchema, MarkdownConfigSchema } from "./sdk-compat.js";
 import { z } from "zod";
+import { DmPolicySchema, GroupPolicySchema, MarkdownConfigSchema } from "./sdk-compat.js";
 
 const allowFromEntry = z.union([z.string(), z.number()]);
 
@@ -32,7 +32,22 @@ const httpConnectionSchema = z.object({
   reportOfflineMessage: z.boolean().optional(),
 });
 
-const connectionSchema = z.discriminatedUnion("type", [wsConnectionSchema, httpConnectionSchema]);
+const nativeConnectionSchema = z.object({
+  type: z.literal("native"),
+  uin: z.number(),
+  password: z.string().optional(),
+  qrLogin: z.boolean().optional(),
+  platform: z.number().optional(),
+  dataDir: z.string().optional(),
+  reportSelfMessage: z.boolean().optional(),
+  reportOfflineMessage: z.boolean().optional(),
+});
+
+const connectionSchema = z.discriminatedUnion("type", [
+  wsConnectionSchema,
+  httpConnectionSchema,
+  nativeConnectionSchema,
+]);
 
 const qqAccountSchema = z.object({
   name: z.string().optional(),
