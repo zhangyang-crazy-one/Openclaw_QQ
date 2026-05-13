@@ -50,6 +50,8 @@ export function buildOb11MessagePayload(params: {
   text?: string;
   replyToId?: string;
   mediaUrl?: string;
+  /** Send text as markdown segment (LLBot converts to QQ native Markdown element type 14). */
+  asMarkdown?: boolean;
 }): string | OB11MessageSegment[] {
   const mediaType = params.mediaUrl ? guessMediaType(params.mediaUrl) : undefined;
 
@@ -69,7 +71,11 @@ export function buildOb11MessagePayload(params: {
   }
 
   if (params.text) {
-    segments.push({ type: "text", data: { text: params.text } });
+    if (params.asMarkdown) {
+      segments.push({ type: "markdown", data: { content: params.text } });
+    } else {
+      segments.push({ type: "text", data: { text: params.text } });
+    }
   }
 
   if (params.mediaUrl) {
@@ -85,6 +91,7 @@ export async function sendOb11Message(params: {
   text?: string;
   replyToId?: string;
   mediaUrl?: string;
+  asMarkdown?: boolean;
 }): Promise<OB11ActionResponse> {
   // 处理本地文件 - 使用 CQ码 方式发送
   if (params.mediaUrl && isLocalPath(params.mediaUrl)) {
@@ -115,6 +122,7 @@ export async function sendOb11Message(params: {
     text: params.text,
     replyToId: params.replyToId,
     mediaUrl: params.mediaUrl,
+    asMarkdown: params.asMarkdown,
   });
 
   if (params.target.kind === "group") {

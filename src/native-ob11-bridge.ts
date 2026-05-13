@@ -12,6 +12,8 @@ export interface SendQqMessageParams {
   text: string;
   mediaUrl?: string;
   replyToId?: string;
+  /** Send text as markdown segment (LLBot converts to QQ native Markdown element). */
+  asMarkdown?: boolean;
 }
 
 export interface SendQqMessageResult {
@@ -46,7 +48,7 @@ export async function sendQqMessage(params: SendQqMessageParams): Promise<SendQq
   if (!client) {
     throw new Error(`QQ client not running for account ${account.accountId}`);
   }
-  const response = await sendOb11Message({ client, target, text, replyToId, mediaUrl });
+  const response = await sendOb11Message({ client, target, text, replyToId, mediaUrl, asMarkdown: params.asMarkdown });
   rememberSelfSentResponse({
     accountId: account.accountId,
     response,
